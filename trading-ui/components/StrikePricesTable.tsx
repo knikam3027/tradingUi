@@ -386,14 +386,9 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   useEffect(() => {
     const fetchStrikes = async () => {
       try {
-        const [res, selfTestRes] = await Promise.all([
-          fetch('/api/market/strikes'),
-          fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000'}/api/v1/market/strikes/translate/self-test`),
-        ]);
-        const [result, selfTestResult] = await Promise.all([
-          res.json(),
-          selfTestRes.json(),
-        ]);
+        const res = await fetch('/api/market/strikes');
+        const result = await res.json();
+
         if (result.status === 'success' && result.data) {
           if (result.data.spotPrice !== null && result.data.spotPrice !== undefined) {
             setSpotPrice(String(result.data.spotPrice));
@@ -418,14 +413,20 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
           }
           setMarketOpen(result.data.marketOpen ?? false);
         }
-        if (selfTestResult.status === 'success' && selfTestResult.data) {
-          setTranslationSelfTest(selfTestResult.data);
-        }
       } catch (error) {
         console.error('Error fetching strikes:', error);
       } finally {
         setLoading(false);
       }
+
+      // Self-test fetch is independent — never block strike data if it fails
+      try {
+        const selfTestRes = await fetch('/api/market/strikes/self-test');
+        const selfTestResult = await selfTestRes.json();
+        if (selfTestResult.status === 'success' && selfTestResult.data) {
+          setTranslationSelfTest(selfTestResult.data);
+        }
+      } catch (_) { /* self-test is optional */ }
     };
 
     fetchStrikes();
