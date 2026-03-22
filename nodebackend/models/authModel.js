@@ -1,7 +1,61 @@
 const { HDFC_BASE_URL, HDFC_API_KEY, HDFC_API_SECRET, HDFC_ACCESS_TOKEN, USER_AGENT } = require('../config');
+const fs = require('fs');
+const path = require('path');
 
-let accessToken = HDFC_ACCESS_TOKEN;
+const TOKEN_FILE = path.join(__dirname, '..', 'data', 'access-token.json');
+
+let accessToken = null;
 let tokenId = null; // session token ID for multi-step login
+
+// Check if a JWT token is expired (with 60s buffer)
+function isTokenExpired(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    if (payload.exp) return Date.now() / 1000 > payload.exp - 60;
+  } catch (_) {}
+  return false;
+}
+
+// Save token to persistent file (lives in Docker volume - survives restarts)
+function persistToken(token) {
+  try {
+    const dir = path.dirname(TOKEN_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ accessToken: token, savedAt: new Date().toISOString() }), 'utf8');
+  } catch (err) {
+    console.error('Failed to persist token:', err.message);
+  }
+}
+
+// Load token on startup: try file first, then .env
+function loadPersistedToken() {
+  // 1. Token file (in Docker volume — survives container rebuilds)
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+      if (data.accessToken && !isTokenExpired(data.accessToken)) {
+        accessToken = data.accessToken;
+        console.log('HDFC Sky: loaded token from persistent storage');
+        return;
+      } else if (data.accessToken) {
+        console.warn('HDFC Sky: persisted token is expired');
+        fs.unlinkSync(TOKEN_FILE);
+      }
+    }
+  } catch (_) {}
+
+  // 2. .env token
+  if (HDFC_ACCESS_TOKEN) {
+    if (!isTokenExpired(HDFC_ACCESS_TOKEN)) {
+      accessToken = HDFC_ACCESS_TOKEN;
+      console.log('HDFC Sky: loaded token from .env');
+      // Persist it so future restarts use the file
+      persistToken(HDFC_ACCESS_TOKEN);
+    } else {
+      console.warn('HDFC Sky: HDFC_ACCESS_TOKEN in .env is expired - visit /auth/login to re-authenticate');
+    }
+  }
+}
 
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT };
 
@@ -93,6 +147,12 @@ function getAccessToken() {
 
 function setAccessToken(token) {
   accessToken = token;
+  if (token) {
+    persistToken(token);
+  } else {
+    // Clear persisted token on logout/expiry
+    try { if (fs.existsSync(TOKEN_FILE)) fs.unlinkSync(TOKEN_FILE); } catch (_) {}
+  }
 }
 
 function getTokenIdValue() {
@@ -100,10 +160,17 @@ function getTokenIdValue() {
 }
 
 function isConnected() {
-  return !!accessToken;
+  if (!accessToken) return false;
+  if (isTokenExpired(accessToken)) {
+    console.warn('HDFC Sky: access token expired - clearing');
+    setAccessToken(null);
+    return false;
+  }
+  return true;
 }
 
 module.exports = {
+  loadPersistedToken,
   getTokenId,
   loginValidate,
   validateOTP,

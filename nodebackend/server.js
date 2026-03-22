@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const { PORT, CORS_ORIGINS } = require('./config');
-const { isConnected } = require('./models/authModel');
+const { loadPersistedToken, isConnected } = require('./models/authModel');
 const authRoutes = require('./routes/authRoutes');
 const apiRoutes = require('./routes/apiRoutes');
+
+// Load HDFC Sky token from file or .env on startup
+loadPersistedToken();
 
 const app = express();
 

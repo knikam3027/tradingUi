@@ -13,6 +13,7 @@ services:
       - ../nodebackend/.env
     environment:
       - PORT=8000
+      - FRONTEND_URL=https://cbamoon.com
     volumes:
       - nodebackend_data:/app/data
     healthcheck:

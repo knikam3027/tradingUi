@@ -7,6 +7,7 @@ module.exports = {
   HDFC_API_KEY: process.env.HDFC_API_KEY,
   HDFC_API_SECRET: process.env.HDFC_API_SECRET,
   HDFC_ACCESS_TOKEN: process.env.HDFC_ACCESS_TOKEN || null,
+  FRONTEND_URL: process.env.FRONTEND_URL || 'http://localhost:3000',
   USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   CORS_ORIGINS: ['http://localhost:3000', 'http://127.0.0.1:3000', 'https://cbamoon.com', 'https://www.cbamoon.com'],
 };

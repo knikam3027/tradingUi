@@ -9,7 +9,7 @@ node_modules/
 .env.development
 
 # ── Node backend ──────────────────────────────────────────────
-nodebackend/data/last-close-strikes.json
+# nodebackend/data/last-close-strikes.json
 nodebackend/data/straddle-history.json
 *.log
 npm-debug.log*

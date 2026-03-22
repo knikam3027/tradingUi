@@ -1,4 +1,4 @@
-const { HDFC_BASE_URL, HDFC_API_KEY } = require('../config');
+const { HDFC_BASE_URL, HDFC_API_KEY, FRONTEND_URL } = require('../config');
 const {
   getTokenId, loginValidate, validateOTP, validate2FA, authorize,
   exchangeToken, setAccessToken, isConnected, getTokenIdValue,
@@ -20,7 +20,7 @@ exports.callback = async (req, res) => {
     if (data.accessToken) {
       setAccessToken(data.accessToken);
       console.log('HDFC Sky access token obtained successfully');
-      res.redirect('http://localhost:3000');
+      res.redirect(FRONTEND_URL);
     } else {
       console.error('Failed to get access token:', data);
       res.status(401).json({ status: 'error', message: 'Failed to get access token', data });

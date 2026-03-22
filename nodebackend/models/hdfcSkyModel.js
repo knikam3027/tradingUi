@@ -1,5 +1,13 @@
 const { HDFC_BASE_URL, HDFC_API_KEY, USER_AGENT } = require('../config');
-const { getAccessToken } = require('./authModel');
+const { getAccessToken, setAccessToken } = require('./authModel');
+
+function handleHdfcAuthError(status, context) {
+  if (status === 401 || status === 403) {
+    console.warn(`HDFC Sky: ${context} returned ${status} - token expired, disconnecting`);
+    setAccessToken(null);
+    throw new Error(`HDFC Sky token expired (${status}) - please re-login at /auth/login`);
+  }
+}
 const fs = require('fs/promises');
 const { writeFileSync, readFileSync, existsSync, mkdirSync } = require('fs');
 const path = require('path');
@@ -229,6 +237,7 @@ async function fetchLTP(tokens) {
       });
 
       if (!res.ok) {
+        handleHdfcAuthError(res.status, 'fetch-ltp');
         const text = await res.text();
         throw new Error(`fetch-ltp ${res.status}: ${text}`);
       }
@@ -295,6 +304,7 @@ async function _fetchCandleOnce(symbol, exchange, seriesType, chartType, start, 
     });
 
     if (!res.ok) {
+      handleHdfcAuthError(res.status, 'fetch-candle');
       const text = await res.text();
       throw new Error(`fetch-candle ${res.status}: ${text}`);
     }
