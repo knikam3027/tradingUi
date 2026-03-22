@@ -74,6 +74,38 @@ export default function Home() {
     setMounted(true);
   }, []);
 
+  // Handle HDFC Sky OAuth callback: ?requestToken=xxx lands on this page
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const requestToken = params.get('requestToken') || params.get('request_token');
+    if (!requestToken) return;
+
+    // Clean the URL immediately so it doesn't re-trigger on refresh
+    window.history.replaceState({}, '', window.location.pathname);
+
+    // Use relative URL so it goes through nginx → backend (works in both dev and prod)
+    fetch(`/auth/exchange?token=${encodeURIComponent(requestToken)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.status === 'success') {
+          console.log('HDFC Sky connected successfully');
+          setConnected(true);
+          // Store connection flag in localStorage so navbar stays green across refreshes
+          localStorage.setItem('hdfc_connected', 'true');
+        } else {
+          console.error('Token exchange failed:', data.message);
+        }
+      })
+      .catch((err) => console.error('Token exchange error:', err));
+  }, []);
+
+  // Restore connected state from localStorage on load
+  useEffect(() => {
+    if (localStorage.getItem('hdfc_connected') === 'true') {
+      setConnected(true);
+    }
+  }, []);
+
   // Fetch live NIFTY price
   useEffect(() => {
     const fetchNifty = async () => {
@@ -85,9 +117,12 @@ export default function Home() {
           setNiftyChange(result.data.change ?? null);
           setNiftyChangePercent(result.data.changePercent ?? null);
           setConnected(true);
+          localStorage.setItem('hdfc_connected', 'true');
           setLastUpdated(new Date().toLocaleTimeString('en-IN', { hour12: false }));
         } else {
-          setConnected(result.connected ?? false);
+          const isConn = result.connected ?? false;
+          setConnected(isConn);
+          if (!isConn) localStorage.removeItem('hdfc_connected');
         }
       } catch {
         setConnected(false);
