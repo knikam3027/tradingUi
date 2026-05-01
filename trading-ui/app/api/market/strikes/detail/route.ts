@@ -9,7 +9,7 @@ export async function GET(request: NextRequest) {
   try {
     const backendUrl = getBackendUrl();
     const query = request.nextUrl.searchParams.toString();
-    const backendPath = `/api/v1/market/strikes${query ? `?${query}` : ''}`;
+    const backendPath = `/api/v1/market/strikes/detail${query ? `?${query}` : ''}`;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60_000);
@@ -30,7 +30,7 @@ export async function GET(request: NextRequest) {
         {
           status: 'error',
           message: payload?.message || `Backend error: ${response.statusText}`,
-          error: payload?.error || 'Failed to fetch strike data',
+          error: payload?.error || 'Failed to fetch strike detail',
         },
         { status: response.status }
       );
@@ -38,11 +38,11 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(payload);
   } catch (error) {
-    console.error('Error fetching strikes:', error);
+    console.error('Error fetching strike detail:', error);
     return NextResponse.json(
       {
         status: 'error',
-        message: 'Failed to fetch strike data',
+        message: 'Failed to fetch strike detail',
         error: error instanceof Error ? error.message : 'Unknown error',
       },
       { status: 500 }

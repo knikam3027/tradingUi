@@ -287,11 +287,18 @@ interface StrikeRow {
   lead: string;
   cDelta: number;
   cVolume: string;
+  ivChange?: number | null;
+  netDelta?: number | null;
+  deltaChange?: number | null;
+  volumeSurge?: number | null;
+  currentVolume?: number | null;
+  avgVolume20?: number | null;
   regime: string;
   indReg: string;
   tMode: string;
   tType: string;
   isATM: boolean;
+  indicators?: Indicators;
 }
 
 interface Indicators {
@@ -303,22 +310,19 @@ interface Indicators {
   chop: number | null;
 }
 
-interface TranslationSelfTest {
-  passed: boolean;
-  sample?: {
-    strike: number;
-    indicators?: {
-      rsi: number | null;
-      roc: number | null;
-      adx: number | null;
-      di_plus: number | null;
-      di_minus: number | null;
-      chop: number | null;
-    };
-  };
+interface StrikeSnapshotCache {
+  strikes?: StrikeRow[];
+  indicators?: Indicators;
+  spotPrice?: string | number | null;
+  selectedStrike?: string | number | null;
+  expiry?: string | null;
+  cachedAt?: string | null;
+  updatedAt?: string | null;
+  fallbackSource?: string | null;
+  isStale?: boolean;
 }
 
-const STRIKES_CACHE_KEY = 'market.strikes.last_snapshot.v1';
+const STRIKES_CACHE_KEY = 'market.strikes.last_snapshot.v4';
 
 const EMPTY_INDICATORS: Indicators = {
   rsi: null,
@@ -345,6 +349,113 @@ function formatIndicatorValue(value: number | null, digits = 1) {
   return Number.isInteger(value) ? String(value) : value.toFixed(digits);
 }
 
+function formatSignedValue(value?: number | null, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '--';
+  }
+
+  const formatted = value.toFixed(digits);
+  return value > 0 ? `+${formatted}` : formatted;
+}
+
+function formatMultiplier(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '--';
+  }
+
+  return `${value.toFixed(1)}x`;
+}
+
+function signedValueClass(value?: number | null, positive = 'text-green-400', negative = 'text-red-400') {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'text-gray-400';
+  }
+
+  return value >= 0 ? positive : negative;
+}
+
+function volumeSurgeClass(value?: number | null) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 'text-gray-400';
+  }
+  if (value >= 2.5) {
+    return 'text-orange-300 font-bold';
+  }
+  if (value >= 1.5) {
+    return 'text-yellow-300 font-bold';
+  }
+  return 'text-slate-300';
+}
+
+function parseDateOnly(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isUsableCachedSnapshot(snapshot?: StrikeSnapshotCache | null) {
+  if (!snapshot?.strikes?.length || snapshot.isStale) {
+    return false;
+  }
+
+  // Old localStorage entries did not include expiry/spot metadata. Do not reuse
+  // them because they can show expired strikes with fresh-looking timestamps.
+  if (!snapshot.expiry || snapshot.spotPrice === null || snapshot.spotPrice === undefined) {
+    return false;
+  }
+
+  const expiry = parseDateOnly(snapshot.expiry);
+  if (!expiry) {
+    return false;
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  expiry.setHours(0, 0, 0, 0);
+  if (expiry < today) {
+    return false;
+  }
+
+  const timestamp = parseDateOnly(snapshot.cachedAt || snapshot.updatedAt);
+  if (!timestamp) {
+    return false;
+  }
+
+  return Date.now() - timestamp.getTime() <= 3 * 24 * 60 * 60 * 1000;
+}
+
+function centerStrikeRows(rows: StrikeRow[], centerStrike: number | null, radius = 2) {
+  if (rows.length <= (radius * 2) + 1 && centerStrike === null) {
+    return rows;
+  }
+
+  const centerIndex = centerStrike !== null
+    ? rows.findIndex((row) => Number(row.strike) === centerStrike)
+    : rows.findIndex((row) => row.isATM);
+
+  if (centerIndex < 0) {
+    return rows.slice(0, (radius * 2) + 1);
+  }
+
+  const windowSize = (radius * 2) + 1;
+  let start = centerIndex - radius;
+  let end = centerIndex + radius + 1;
+
+  if (start < 0) {
+    end += -start;
+    start = 0;
+  }
+  if (end > rows.length) {
+    start = Math.max(0, start - (end - rows.length));
+    end = rows.length;
+  }
+
+  return rows.slice(start, end).slice(0, windowSize);
+}
+
 const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   const [mounted, setMounted] = useState(false);
   const [showManualPopup, setShowManualPopup] = useState(false);
@@ -352,11 +463,14 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
 
   // Live data state
   const [strikeData, setStrikeData] = useState<StrikeRow[]>([]);
+  const [selectedStrike, setSelectedStrike] = useState<number | null>(null);
   const [spotPrice, setSpotPrice] = useState<string | null>(null);
   const [indicators, setIndicators] = useState<Indicators>(EMPTY_INDICATORS);
+  const [indicatorSource, setIndicatorSource] = useState<string | null>(null);
   const [marketOpen, setMarketOpen] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [translationSelfTest, setTranslationSelfTest] = useState<TranslationSelfTest | null>(null);
+  const [strikeLevelIndicators, setStrikeLevelIndicators] = useState<Indicators | null>(null);
+  const [strikeLevelIndicatorSource, setStrikeLevelIndicatorSource] = useState<string | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -370,12 +484,25 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         return;
       }
 
-      const cached = JSON.parse(cachedRaw) as { strikes?: StrikeRow[]; indicators?: Indicators };
+      const cached = JSON.parse(cachedRaw) as StrikeSnapshotCache;
+      if (!isUsableCachedSnapshot(cached)) {
+        localStorage.removeItem(STRIKES_CACHE_KEY);
+        return;
+      }
+
       if (cached?.strikes?.length) {
         setStrikeData(cached.strikes);
       }
+      const cachedSelectedStrike = Number(cached?.selectedStrike ?? cached?.strikes?.find((row) => row.isATM)?.strike);
+      if (Number.isFinite(cachedSelectedStrike)) {
+        setSelectedStrike(cachedSelectedStrike);
+      }
+      if (cached?.spotPrice !== null && cached?.spotPrice !== undefined) {
+        setSpotPrice(String(cached.spotPrice));
+      }
       if (hasIndicatorValues(cached?.indicators)) {
         setIndicators((prev) => ({ ...prev, ...cached.indicators }));
+        setIndicatorSource(cached.fallbackSource || 'local_cache');
       }
     } catch (error) {
       console.error('Error restoring strike cache:', error);
@@ -386,12 +513,30 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   useEffect(() => {
     const fetchStrikes = async () => {
       try {
-        const res = await fetch('/api/market/strikes');
+        const query = selectedStrike !== null ? `?selectedStrike=${encodeURIComponent(String(selectedStrike))}` : '';
+        const res = await fetch(`/api/market/strikes${query}`);
         const result = await res.json();
 
         if (result.status === 'success' && result.data) {
+          const fallbackSource = result.data.fallbackSource || 'live';
+          if (result.data.isStale || fallbackSource === 'stale_snapshot') {
+            setStrikeData([]);
+            setIndicators(EMPTY_INDICATORS);
+            setIndicatorSource('stale_snapshot');
+            setMarketOpen(false);
+            localStorage.removeItem(STRIKES_CACHE_KEY);
+            if (result.data.spotPrice !== null && result.data.spotPrice !== undefined) {
+              setSpotPrice(String(result.data.spotPrice));
+            }
+            return;
+          }
+
           if (result.data.spotPrice !== null && result.data.spotPrice !== undefined) {
             setSpotPrice(String(result.data.spotPrice));
+          }
+          const resolvedSelectedStrike = Number(result.data.selectedStrike ?? result.data.atmStrike);
+          if (Number.isFinite(resolvedSelectedStrike)) {
+            setSelectedStrike(resolvedSelectedStrike);
           }
           if (result.data.strikes?.length > 0) {
             setStrikeData(result.data.strikes);
@@ -401,6 +546,12 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                 JSON.stringify({
                   strikes: result.data.strikes,
                   indicators: result.data.indicators || {},
+                  spotPrice: result.data.spotPrice ?? null,
+                  selectedStrike: result.data.selectedStrike ?? result.data.atmStrike ?? selectedStrike,
+                  expiry: result.data.expiry ?? null,
+                  cachedAt: result.data.cachedAt ?? null,
+                  fallbackSource,
+                  isStale: false,
                   updatedAt: new Date().toISOString(),
                 })
               );
@@ -410,6 +561,10 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
           }
           if (hasIndicatorValues(result.data.indicators)) {
             setIndicators({ ...EMPTY_INDICATORS, ...result.data.indicators });
+            setIndicatorSource(fallbackSource);
+          } else {
+            setIndicators(EMPTY_INDICATORS);
+            setIndicatorSource(null);
           }
           setMarketOpen(result.data.marketOpen ?? false);
         }
@@ -419,20 +574,59 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         setLoading(false);
       }
 
-      // Self-test fetch is independent — never block strike data if it fails
-      try {
-        const selfTestRes = await fetch('/api/market/strikes/self-test');
-        const selfTestResult = await selfTestRes.json();
-        if (selfTestResult.status === 'success' && selfTestResult.data) {
-          setTranslationSelfTest(selfTestResult.data);
-        }
-      } catch (_) { /* self-test is optional */ }
     };
 
     fetchStrikes();
     const interval = setInterval(fetchStrikes, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedStrike]);
+
+  // Fetch strike-level indicators when strike is selected
+  useEffect(() => {
+    if (!selectedStrike || !strikeData.length) {
+      setStrikeLevelIndicators(null);
+      setStrikeLevelIndicatorSource(null);
+      return;
+    }
+
+    const fetchStrikeDetail = async () => {
+      try {
+        const selectedRow = strikeData.find((row) => Number(row.strike) === selectedStrike);
+        if (!selectedRow) {
+          setStrikeLevelIndicators(null);
+          setStrikeLevelIndicatorSource(null);
+          return;
+        }
+        if (hasIndicatorValues(selectedRow.indicators)) {
+          setStrikeLevelIndicators(null);
+          setStrikeLevelIndicatorSource(null);
+          return;
+        }
+
+        const ce = selectedRow.ce || 0;
+        const pe = selectedRow.pe || 0;
+
+        const res = await fetch(
+          `/api/market/strikes/detail?strike=${selectedStrike}&ce_ltp=${ce}&pe_ltp=${pe}`
+        );
+        const result = await res.json();
+
+        if (result.status === 'success' && result.data?.indicators) {
+          setStrikeLevelIndicators(result.data.indicators);
+          setStrikeLevelIndicatorSource(result.data.indicatorSource || null);
+        } else {
+          setStrikeLevelIndicators(null);
+          setStrikeLevelIndicatorSource(null);
+        }
+      } catch (error) {
+        console.error('Error fetching strike detail:', error);
+        setStrikeLevelIndicators(null);
+        setStrikeLevelIndicatorSource(null);
+      }
+    };
+
+    fetchStrikeDetail();
+  }, [selectedStrike, strikeData]);
 
   if (!mounted) {
     return (
@@ -453,19 +647,50 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
     );
   }
 
-  const showLiveIndicators = hasIndicatorValues(indicators);
-  const selfTestIndicators = translationSelfTest?.sample?.indicators;
-  const showSelfTest = !showLiveIndicators && translationSelfTest?.passed && selfTestIndicators;
-  const displayedIndicators: Indicators = showSelfTest
-    ? {
-        roc: selfTestIndicators?.roc ?? null,
-        rsi: selfTestIndicators?.rsi ?? null,
-        minusDI: selfTestIndicators?.di_minus ?? null,
-        plusDI: selfTestIndicators?.di_plus ?? null,
-        adx: selfTestIndicators?.adx ?? null,
-        chop: selfTestIndicators?.chop ?? null,
-      }
-    : indicators;
+  const selectedStrikeRow = selectedStrike !== null
+    ? strikeData.find((row) => Number(row.strike) === selectedStrike)
+    : strikeData.find((row) => row.isATM);
+  const selectedRowIndicators = selectedStrikeRow?.indicators;
+  const hasSelectedRowIndicators = hasIndicatorValues(selectedRowIndicators);
+  const hasStrikeLevelIndicators = hasIndicatorValues(strikeLevelIndicators);
+  const hasUsableStrikeLevelIndicators =
+    hasStrikeLevelIndicators && strikeLevelIndicatorSource !== 'spot_fallback';
+  
+  // For a selected strike, only show that strike's CE+PE candle indicators.
+  // Do not reuse the global market strip because it makes 24100/24200 look static.
+  const displayedIndicators: Indicators = hasSelectedRowIndicators
+    ? { ...EMPTY_INDICATORS, ...selectedRowIndicators }
+    : hasUsableStrikeLevelIndicators
+      ? { ...EMPTY_INDICATORS, ...strikeLevelIndicators }
+      : selectedStrike !== null
+        ? EMPTY_INDICATORS
+        : indicators;
+  const displayedIndicatorSource = hasSelectedRowIndicators
+    ? 'strike_candles'
+    : hasUsableStrikeLevelIndicators
+      ? strikeLevelIndicatorSource
+      : selectedStrike !== null
+        ? null
+        : indicatorSource;
+  const isFallbackIndicatorSource = displayedIndicatorSource === 'spot_fallback';
+  const isCachedIndicatorSource = ['last_snapshot', 'local_cache', 'cached_strike'].includes(displayedIndicatorSource || '');
+  const isStaleIndicatorSource = displayedIndicatorSource === 'stale_snapshot';
+
+  const hasDisplayedIndicators = hasIndicatorValues(displayedIndicators);
+  const showLiveIndicators = hasDisplayedIndicators && !isCachedIndicatorSource && !isStaleIndicatorSource;
+  const showCachedIndicators = hasDisplayedIndicators && isCachedIndicatorSource;
+  const indicatorLabel = showLiveIndicators
+    ? selectedStrike
+      ? isFallbackIndicatorSource
+        ? 'MARKET INDICATORS'
+        : 'STRIKE LEVEL INDICATORS'
+      : 'LIVE INDICATORS'
+    : showCachedIndicators
+      ? 'CACHED INDICATORS'
+      : isStaleIndicatorSource
+        ? 'STALE SNAPSHOT'
+        : 'NO INDICATOR CANDLES';
+  const visibleStrikeData = centerStrikeRows(strikeData, selectedStrike);
 
   return (
     <div className={`border border-gray-700 bg-[#020617] rounded-md overflow-hidden ${className}`}>
@@ -473,7 +698,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         <table className="w-full text-[10px] border-collapse">
           <thead className="bg-[#1d4ed8]">
             <tr>
-              {["STRIKE", "C.IV", "OPEN", "LTP", "CE", "PE", "CHANGE", "LEAD", "C.DELTA", "C.VOLUME", "REGIME", "IND.REG", "T.MODE", "T.TYPE", "MANUAL"].map(h => (
+              {["STRIKE", "C.IV", "IV CHG", "OPEN", "LTP", "CE", "PE", "CHANGE", "LEAD", "NET DELTA", "VOL SURGE", "REGIME", "IND.REG", "T.MODE", "T.TYPE", "MANUAL"].map(h => (
                 <th key={h} className="px-1 py-1 text-left font-bold text-white border-r border-blue-900 whitespace-nowrap">
                   {h}
                 </th>
@@ -482,17 +707,25 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
           </thead>
 
           <tbody>
-            {strikeData.length === 0 ? (
+            {visibleStrikeData.length === 0 ? (
               <tr>
-                <td colSpan={15} className="px-4 py-8 text-center text-gray-500">
+                <td colSpan={16} className="px-4 py-8 text-center text-gray-500">
                   {loading ? 'Loading strike data...' : !marketOpen ? 'Market is closed - showing last close prices.' : 'No strike data available'}
                 </td>
               </tr>
-            ) : strikeData.map((row, i) => {
+            ) : visibleStrikeData.map((row, i) => {
+              const isSelectedCenter = selectedStrike !== null ? Number(row.strike) === selectedStrike : row.isATM;
               return (
-              <tr key={i} className={`border-t border-gray-800 transition-colors ${row.isATM ? 'bg-yellow-900/40 border-yellow-600' : 'hover:bg-gray-800/50'}`}>
-                <td className={`px-1 py-1 font-mono ${row.isATM ? 'text-yellow-300 font-bold' : 'text-gray-400'}`}>{row.strike}</td>
+              <tr
+                key={i}
+                onClick={() => setSelectedStrike(Number(row.strike))}
+                className={`cursor-pointer border-t border-gray-800 transition-colors ${isSelectedCenter ? 'bg-yellow-900/40 border-yellow-600' : 'hover:bg-gray-800/50'}`}
+              >
+                <td className={`px-1 py-1 font-mono ${isSelectedCenter ? 'text-yellow-300 font-bold' : 'text-gray-400'}`}>{row.strike}</td>
                 <td className="px-1 py-1 text-purple-400 font-semibold">{row.cIV}</td>
+                <td className={`px-1 py-1 font-semibold ${signedValueClass(row.ivChange)}`}>
+                  {formatSignedValue(row.ivChange, 2)}
+                </td>
                 <td className="px-1 py-1 text-gray-400">{row.open}</td>
                 <td className="px-1 py-1 font-bold text-white">{row.ltp}</td>
                 <td className="px-1 py-1 text-blue-300 font-semibold">{row.ce}</td>
@@ -503,10 +736,12 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                 <td className="px-1 py-1 text-orange-400">
                   {row.lead}
                 </td>
-                <td className={`px-1 py-1 font-semibold ${row.cDelta >= 0 ? "text-green-400" : "text-red-400"}`}>
-                  {row.cDelta}
+                <td className={`px-1 py-1 font-semibold ${signedValueClass(row.netDelta ?? row.cDelta)}`}>
+                  {formatSignedValue(row.netDelta ?? row.cDelta, 2)}
                 </td>
-                <td className="px-1 py-1 text-yellow-400 font-semibold">{row.cVolume}</td>
+                <td className={`px-1 py-1 ${volumeSurgeClass(row.volumeSurge)}`}>
+                  {formatMultiplier(row.volumeSurge)}
+                </td>
                 <td className={`px-1 py-1 font-bold text-center ${row.regime === 'BEARISH' ? 'text-red-400' : row.regime === 'SHORT COV' ? 'text-orange-400' : row.regime === 'BULLISH' ? 'text-green-400' : 'text-gray-400'}`}>
                   {row.regime}
                 </td>
@@ -517,7 +752,8 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                 {/* MANUAL Column */}
                 <td className="px-1 py-1">
                   <button
-                    onClick={() => {
+                    onClick={(event) => {
+                      event.stopPropagation();
                       setManualPopupData({
                         strike: String(row.strike),
                         ce: String(row.ce),
@@ -554,12 +790,17 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         {/* Indicators Footer */}
         <div className="border-t border-gray-700 bg-[#020617] text-[11px] px-3 py-2">
           <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px]">
-            <span className={`rounded px-2 py-0.5 font-semibold ${showLiveIndicators ? 'bg-emerald-900/40 text-emerald-300' : showSelfTest ? 'bg-amber-900/40 text-amber-300' : 'bg-slate-900/60 text-slate-400'}`}>
-              {showLiveIndicators ? 'LIVE INDICATORS' : showSelfTest ? 'SELF-TEST INDICATORS' : 'NO INDICATOR CANDLES'}
+            <span className={`rounded px-2 py-0.5 font-semibold ${showLiveIndicators ? 'bg-emerald-900/40 text-emerald-300' : showCachedIndicators ? 'bg-amber-900/40 text-amber-300' : 'bg-slate-900/60 text-slate-400'}`}>
+              {indicatorLabel}
             </span>
-            {showSelfTest && translationSelfTest?.sample?.strike ? (
+            {selectedStrike !== null ? (
+              <span className="rounded bg-blue-950/60 px-2 py-0.5 font-semibold text-blue-300">
+                CENTER {selectedStrike}
+              </span>
+            ) : null}
+            {isStaleIndicatorSource ? (
               <span className="text-slate-400">
-                Using tested sample for strike {translationSelfTest.sample.strike} because live CE/PE candle history is unavailable.
+                Live option-chain data is unavailable. Expired cached strikes were cleared.
               </span>
             ) : null}
           </div>
@@ -601,6 +842,34 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
               </div>
             </div>
           </div>
+          {selectedStrikeRow ? (
+            <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-4">
+              <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                <div className="text-[9px] font-semibold tracking-wide text-slate-500">COMB PREMIUM</div>
+                <div className="text-sm font-bold text-white">
+                  {Number.isFinite(selectedStrikeRow.ltp) ? selectedStrikeRow.ltp.toFixed(2) : '--'}
+                </div>
+              </div>
+              <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                <div className="text-[9px] font-semibold tracking-wide text-slate-500">IV CHG</div>
+                <div className={`text-sm font-bold ${signedValueClass(selectedStrikeRow.ivChange)}`}>
+                  {formatSignedValue(selectedStrikeRow.ivChange, 2)}
+                </div>
+              </div>
+              <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                <div className="text-[9px] font-semibold tracking-wide text-slate-500">NET DELTA</div>
+                <div className={`text-sm font-bold ${signedValueClass(selectedStrikeRow.netDelta ?? selectedStrikeRow.cDelta)}`}>
+                  {formatSignedValue(selectedStrikeRow.netDelta ?? selectedStrikeRow.cDelta, 2)}
+                </div>
+              </div>
+              <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                <div className="text-[9px] font-semibold tracking-wide text-slate-500">VOL SURGE</div>
+                <div className={`text-sm ${volumeSurgeClass(selectedStrikeRow.volumeSurge)}`}>
+                  {formatMultiplier(selectedStrikeRow.volumeSurge)}
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -608,4 +877,3 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
 };
 
 export default StrikePricesTable;
-

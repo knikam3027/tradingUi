@@ -14,6 +14,7 @@
 *.conf text eol=lf
 *.py   text eol=lf
 
+
 # Binary files — no line-ending conversion
 *.png  binary
 *.jpg  binary
@@ -23,3 +24,4 @@
 *.woff2 binary
 *.ttf  binary
 *.eot  binary
+

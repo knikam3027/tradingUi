@@ -17,7 +17,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Backend URL is embedded at build time (Next.js NEXT_PUBLIC_ vars)
-ARG NEXT_PUBLIC_BACKEND_URL=http://nodebackend:8000
+ARG NEXT_PUBLIC_BACKEND_URL=http://pythonbackend:8000
 ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
 
 # Build the application

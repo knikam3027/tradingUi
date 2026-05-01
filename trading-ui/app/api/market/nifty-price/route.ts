@@ -1,11 +1,16 @@
 import { NextResponse } from 'next/server';
 
+function getBackendUrl() {
+  return (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000')
+    .replace('http://localhost:', 'http://127.0.0.1:');
+}
+
 export async function GET() {
   try {
-    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+    const backendUrl = getBackendUrl();
     
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    const timeout = setTimeout(() => controller.abort(), 30_000);
 
     const response = await fetch(`${backendUrl}/api/v1/market/nifty-price`, {
       method: 'GET',

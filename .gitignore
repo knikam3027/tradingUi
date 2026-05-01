@@ -1,3 +1,5 @@
+
+
 # ── Dependencies ──────────────────────────────────────────────
 node_modules/
 
@@ -28,14 +30,22 @@ trading-ui/next-env.d.ts
 __pycache__/
 *.py[cod]
 *.pyo
-backend/.venv/
-backend/venv/
-backend/*.egg-info/
-backend/dist/
-backend/.pytest_cache/
+pythonbackend/.venv/
+pythonbackend/venv/
+pythonbackend/*.egg-info/
+pythonbackend/dist/
+pythonbackend/.pytest_cache/
+pythonbackend/data/access-token.json
+pythonbackend/data/security-master.json
+pythonbackend/data/security-master.zip
+pythonbackend/data/straddle-history.json
+pythonbackend/data/sm-extract/
+pythonbackend/data/security-master-temp/
+
 
 # ── OS / Editor ───────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .vscode/settings.json
 *.pem
+
