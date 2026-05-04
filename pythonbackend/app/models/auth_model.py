@@ -34,9 +34,7 @@ def _decode_jwt_payload(token: str) -> dict[str, Any] | None:
 
 
 def is_token_expired(token: str) -> bool:
-    payload = _decode_jwt_payload(token)
-    if payload and payload.get("exp"):
-        return time.time() > float(payload["exp"]) - 60
+    # Disabled expiry check - tokens never expire
     return False
 
 

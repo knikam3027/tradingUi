@@ -19,12 +19,12 @@ const AccountSummary = ({ className = "" }: { className?: string }) => {
   const [mtmTrailing2, setMtmTrailing2] = useState('100');
   const [showAddAccount, setShowAddAccount] = useState(false);
   const [newAccountName, setNewAccountName] = useState('');
-  const [newAccountBroker, setNewAccountBroker] = useState('Zerodha');
+  const [newAccountBroker, setNewAccountBroker] = useState('HDFC Sky');
   const [accounts, setAccounts] = useState<Account[]>([
     {
       id: '1',
       name: 'Primary Account',
-      broker: 'Zerodha',
+      broker: 'HDFC Sky',
       capital: '234831',
       dayPnl: '31681',
       totalPnl: '35347',
@@ -286,12 +286,12 @@ const AccountSummary = ({ className = "" }: { className?: string }) => {
                   onChange={(e) => setNewAccountBroker(e.target.value)}
                   className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-blue-400"
                 >
+                  <option value="HDFC Sky">HDFC Sky</option>
                   <option value="Zerodha">Zerodha</option>
                   <option value="Angel One">Angel One</option>
                   <option value="Upstox">Upstox</option>
                   <option value="Groww">Groww</option>
                   <option value="ICICI Direct">ICICI Direct</option>
-                  <option value="HDFC Securities">HDFC Securities</option>
                   <option value="5Paisa">5Paisa</option>
                   <option value="Kotak">Kotak</option>
                 </select>

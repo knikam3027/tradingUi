@@ -13,7 +13,7 @@ const TradingSettingsModal = ({ isOpen, onClose }: TradingSettingsModalProps) =>
     // Broker API Settings
     brokerApiKey: '',
     brokerSecret: '',
-    brokerName: 'Zerodha',
+    brokerName: 'HDFC Sky',
     brokerUserId: '',
     
     // TradingView API Settings  
@@ -129,6 +129,7 @@ const TradingSettingsModal = ({ isOpen, onClose }: TradingSettingsModalProps) =>
                       onChange={(e) => handleInputChange('brokerName', e.target.value)}
                       className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-md text-white focus:outline-none focus:border-blue-500"
                     >
+                      <option value="HDFC Sky">HDFC Sky</option>
                       <option value="Zerodha">Zerodha Kite</option>
                       <option value="Upstox">Upstox</option>
                       <option value="AngelOne">Angel One</option>

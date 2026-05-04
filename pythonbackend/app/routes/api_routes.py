@@ -571,7 +571,7 @@ async def resolve_strike_detail_indicators(strike: float) -> tuple[dict[str, flo
     if has_indicator_values(cached_indicators):
         return cached_indicators, "cached_strike"
 
-    bot_indicators = load_bot_historical_indicators(strike, ce_close + pe_close, None)
+    bot_indicators = load_bot_historical_indicators(strike, None, None)
     if has_indicator_values(bot_indicators):
         return bot_indicators, "bot_price_projected_3m"
 
