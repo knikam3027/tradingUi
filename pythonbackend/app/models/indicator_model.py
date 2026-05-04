@@ -1,4 +1,5 @@
 import math
+import pandas as pd
 from typing import Any
 
 from app.models.price_calculator import calculate_dynamic_premium
@@ -723,3 +724,56 @@ def calc_implied_volatility(
         if sigma > 5:
             sigma = 5
     return round(sigma * 100, 1)
+
+
+def calc_rsi(df, length=14):
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.ewm(span=length, adjust=False).mean()
+    avg_loss = loss.ewm(span=length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_roc(df, length=9):
+    return ((df['close'] - df['close'].shift(length)) / df['close'].shift(length)) * 100
+
+
+def calc_dmi_adx(df, length=14):
+    up_move = df['high'].diff()
+    down_move = df['low'].diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = -down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['close'].shift()).abs(),
+        (df['low'] - df['close'].shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=length).mean()
+    plus_di = 100 * (plus_dm.rolling(window=length).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(window=length).mean() / atr)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.rolling(window=length).mean()
+
+    return plus_di, minus_di, adx
+
+
+def calc_chop(df, length=14):
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['close'].shift()).abs(),
+        (df['low'] - df['close'].shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=length).sum()
+    high_low_range = df['high'].rolling(window=length).max() - df['low'].rolling(window=length).min()
+
+    chop = 100 * (np.log10(atr / high_low_range) / np.log10(length))
+    return chop

@@ -51,7 +51,7 @@ const Navbar: React.FC<NavbarProps> = ({
         if (result.status === 'success' && result.data?.price) {
           setNiftyPrice(result.data.price);
           setNiftyChange(result.data.changePercent ?? null);
-          setConnected(true);
+          setConnected(result.connected ?? false);
           setLastUpdated(new Date().toLocaleTimeString('en-IN', { hour12: false }));
         } else {
           setConnected(result.connected ?? false);

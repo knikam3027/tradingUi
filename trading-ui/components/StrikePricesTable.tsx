@@ -299,6 +299,8 @@ interface StrikeRow {
   tType: string;
   isATM: boolean;
   indicators?: Indicators;
+  indicatorSource?: string;
+  dynamicPricing?: DynamicPricing;
 }
 
 interface Indicators {
@@ -308,6 +310,24 @@ interface Indicators {
   plusDI: number | null;
   minusDI: number | null;
   chop: number | null;
+}
+
+interface DynamicPricing {
+  base_premium: number;
+  ce_close: number;
+  pe_close: number;
+  dynamic_premium: number;
+  adjustment_factor: number;
+  premium_adjustment_points: number;
+  premium_adjustment_percent: number;
+  adjustments: {
+    roc_factor: number;
+    rsi_factor: number;
+    di_factor: number;
+    adx_factor: number;
+    chop_factor: number;
+  };
+  indicators: Indicators;
 }
 
 interface StrikeSnapshotCache {
@@ -456,6 +476,46 @@ function centerStrikeRows(rows: StrikeRow[], centerStrike: number | null, radius
   return rows.slice(start, end).slice(0, windowSize);
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function projectIndicatorsFromSelectedPrice(
+  indicators: Indicators,
+  selectedRow?: StrikeRow
+): Indicators {
+  if (!selectedRow || !hasIndicatorValues(indicators) || !selectedRow.open || !selectedRow.ltp) {
+    return indicators;
+  }
+
+  const botOpen = 526.5;
+  const botClose = 524.5;
+  const botMovePct = ((botClose - botOpen) / botOpen) * 100;
+  const currentMovePct = ((selectedRow.ltp - selectedRow.open) / selectedRow.open) * 100;
+  const moveDelta = currentMovePct - botMovePct;
+  const trendForce = Math.abs(moveDelta);
+  const bearish = moveDelta < 0;
+
+  let plusDI = indicators.plusDI ?? 0;
+  let minusDI = indicators.minusDI ?? 0;
+  if (bearish) {
+    minusDI += trendForce * 1.4;
+    plusDI = Math.max(0, plusDI - trendForce * 0.8);
+  } else {
+    plusDI += trendForce * 1.4;
+    minusDI = Math.max(0, minusDI - trendForce * 0.8);
+  }
+
+  return {
+    roc: Number(((indicators.roc ?? 0) + moveDelta).toFixed(2)),
+    rsi: Number(clamp((indicators.rsi ?? 50) + moveDelta * 2.5, 0, 100).toFixed(2)),
+    minusDI: Number(clamp(minusDI, 0, 100).toFixed(2)),
+    plusDI: Number(clamp(plusDI, 0, 100).toFixed(2)),
+    adx: Number(clamp((indicators.adx ?? 20) + trendForce * 0.5, 0, 100).toFixed(2)),
+    chop: Number(clamp((indicators.chop ?? 50) - trendForce * 0.35, 0, 100).toFixed(2)),
+  };
+}
+
 const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   const [mounted, setMounted] = useState(false);
   const [showManualPopup, setShowManualPopup] = useState(false);
@@ -467,6 +527,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   const [spotPrice, setSpotPrice] = useState<string | null>(null);
   const [indicators, setIndicators] = useState<Indicators>(EMPTY_INDICATORS);
   const [indicatorSource, setIndicatorSource] = useState<string | null>(null);
+  const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
   const [marketOpen, setMarketOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [strikeLevelIndicators, setStrikeLevelIndicators] = useState<Indicators | null>(null);
@@ -516,6 +577,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         const query = selectedStrike !== null ? `?selectedStrike=${encodeURIComponent(String(selectedStrike))}` : '';
         const res = await fetch(`/api/market/strikes${query}`);
         const result = await res.json();
+        setBackendConnected(result.connected ?? false);
 
         if (result.status === 'success' && result.data) {
           const fallbackSource = result.data.fallbackSource || 'live';
@@ -570,6 +632,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         }
       } catch (error) {
         console.error('Error fetching strikes:', error);
+        setBackendConnected(false);
       } finally {
         setLoading(false);
       }
@@ -651,45 +714,68 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
     ? strikeData.find((row) => Number(row.strike) === selectedStrike)
     : strikeData.find((row) => row.isATM);
   const selectedRowIndicators = selectedStrikeRow?.indicators;
+  const selectedRowIndicatorSource = selectedStrikeRow?.indicatorSource || indicatorSource || 'bot_historical';
   const hasSelectedRowIndicators = hasIndicatorValues(selectedRowIndicators);
   const hasStrikeLevelIndicators = hasIndicatorValues(strikeLevelIndicators);
   const hasUsableStrikeLevelIndicators =
     hasStrikeLevelIndicators && strikeLevelIndicatorSource !== 'spot_fallback';
   
-  // For a selected strike, only show that strike's CE+PE candle indicators.
-  // Do not reuse the global market strip because it makes 24100/24200 look static.
-  const displayedIndicators: Indicators = hasSelectedRowIndicators
+  // For a selected strike, prefer strike-specific indicators.
+  // If these are unavailable, fall back to the live market-level indicators.
+  const rawDisplayedIndicators: Indicators = hasSelectedRowIndicators
     ? { ...EMPTY_INDICATORS, ...selectedRowIndicators }
     : hasUsableStrikeLevelIndicators
       ? { ...EMPTY_INDICATORS, ...strikeLevelIndicators }
-      : selectedStrike !== null
-        ? EMPTY_INDICATORS
-        : indicators;
+      : indicators;
   const displayedIndicatorSource = hasSelectedRowIndicators
-    ? 'strike_candles'
+    ? selectedRowIndicatorSource
     : hasUsableStrikeLevelIndicators
       ? strikeLevelIndicatorSource
-      : selectedStrike !== null
-        ? null
-        : indicatorSource;
+      : indicatorSource;
   const isFallbackIndicatorSource = displayedIndicatorSource === 'spot_fallback';
   const isCachedIndicatorSource = ['last_snapshot', 'local_cache', 'cached_strike'].includes(displayedIndicatorSource || '');
   const isStaleIndicatorSource = displayedIndicatorSource === 'stale_snapshot';
+  const isPriceProjectedSource =
+    displayedIndicatorSource === 'bot_price_projected_3m' ||
+    (
+      Boolean(selectedStrikeRow) &&
+      hasIndicatorValues(rawDisplayedIndicators) &&
+      displayedIndicatorSource !== 'strike_candles' &&
+      displayedIndicatorSource !== 'spot_fallback' &&
+      displayedIndicatorSource !== 'stale_snapshot'
+    );
+  const shouldProjectSelectedPrice = isPriceProjectedSource;
+  const displayedIndicators = shouldProjectSelectedPrice
+    ? projectIndicatorsFromSelectedPrice(rawDisplayedIndicators, selectedStrikeRow)
+    : rawDisplayedIndicators;
 
   const hasDisplayedIndicators = hasIndicatorValues(displayedIndicators);
   const showLiveIndicators = hasDisplayedIndicators && !isCachedIndicatorSource && !isStaleIndicatorSource;
   const showCachedIndicators = hasDisplayedIndicators && isCachedIndicatorSource;
-  const indicatorLabel = showLiveIndicators
-    ? selectedStrike
-      ? isFallbackIndicatorSource
-        ? 'MARKET INDICATORS'
-        : 'STRIKE LEVEL INDICATORS'
-      : 'LIVE INDICATORS'
+  const indicatorLabel = isPriceProjectedSource
+    ? 'BOT 3M PRICE PROJECTED'
+    : showLiveIndicators
+      ? selectedStrike
+        ? isFallbackIndicatorSource
+          ? 'MARKET INDICATORS'
+          : displayedIndicatorSource === 'bot_historical'
+            ? 'BOT HISTORICAL INDICATORS'
+            : 'STRIKE LEVEL INDICATORS'
+        : 'LIVE INDICATORS'
     : showCachedIndicators
       ? 'CACHED INDICATORS'
       : isStaleIndicatorSource
         ? 'STALE SNAPSHOT'
         : 'NO INDICATOR CANDLES';
+  const indicatorHint = !hasDisplayedIndicators
+    ? backendConnected === false
+      ? 'HDFC Sky is disconnected. Connect broker to fetch CE/PE candles for ROC, RSI, DI, ADX and CHOP.'
+      : backendConnected === null
+        ? 'Checking HDFC Sky connection and option candles for ROC, RSI, DI, ADX and CHOP.'
+      : displayedIndicatorSource === 'last_snapshot'
+        ? 'Showing cached prices only. The cached snapshot has no option candle indicators.'
+        : 'HDFC Sky is connected, but CE/PE option candles are unavailable for this strike.'
+    : null;
   const visibleStrikeData = centerStrikeRows(strikeData, selectedStrike);
 
   return (
@@ -803,6 +889,11 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                 Live option-chain data is unavailable. Expired cached strikes were cleared.
               </span>
             ) : null}
+            {indicatorHint ? (
+              <span className="text-slate-400">
+                {indicatorHint}
+              </span>
+            ) : null}
           </div>
           <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
             <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
@@ -868,6 +959,97 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                   {formatMultiplier(selectedStrikeRow.volumeSurge)}
                 </div>
               </div>
+            </div>
+          ) : null}
+
+          {/* Dynamic Pricing Section */}
+          {selectedStrikeRow && selectedStrikeRow.dynamicPricing ? (
+            <div className="mt-4 border-t border-slate-700 pt-3">
+              <div className="mb-2 font-semibold text-slate-300 text-[11px]">DYNAMIC PRICING</div>
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                  <div className="text-[9px] font-semibold tracking-wide text-slate-500">BASE PREMIUM</div>
+                  <div className="text-sm font-bold text-white">
+                    {selectedStrikeRow.dynamicPricing.base_premium?.toFixed(2) || '--'}
+                  </div>
+                  <div className="text-[8px] text-slate-400">(CE + PE)</div>
+                </div>
+                <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                  <div className="text-[9px] font-semibold tracking-wide text-slate-500">DYNAMIC PREMIUM</div>
+                  <div className={`text-sm font-bold ${(selectedStrikeRow.dynamicPricing.premium_adjustment_percent ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {selectedStrikeRow.dynamicPricing.dynamic_premium?.toFixed(2) || '--'}
+                  </div>
+                  <div className="text-[8px] text-slate-400">
+                    {(selectedStrikeRow.dynamicPricing.premium_adjustment_percent ?? 0) >= 0 ? '+' : ''}{selectedStrikeRow.dynamicPricing.premium_adjustment_percent?.toFixed(2)}%
+                  </div>
+                </div>
+                <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                  <div className="text-[9px] font-semibold tracking-wide text-slate-500">ADJUSTMENT</div>
+                  <div className="text-sm font-bold text-cyan-400">
+                    {selectedStrikeRow.dynamicPricing.adjustment_factor?.toFixed(4) || '--'}
+                  </div>
+                  <div className="text-[8px] text-slate-400">
+                    {selectedStrikeRow.dynamicPricing.premium_adjustment_points?.toFixed(2) || '0'} pts
+                  </div>
+                </div>
+                <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+                  <div className="text-[9px] font-semibold tracking-wide text-slate-500">CONFIDENCE</div>
+                  <div className={`text-sm font-bold ${(selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) <= 1.01 && (selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) >= 0.99 ? 'text-yellow-400' : (selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) < 0.99 ? 'text-green-400' : 'text-orange-400'}`}>
+                    {(selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) <= 1.01 && (selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) >= 0.99 ? 'NEUTRAL' : (selectedStrikeRow.dynamicPricing.adjustment_factor ?? 1) < 0.99 ? 'HIGH' : 'LOW'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Indicator Adjustments Breakdown */}
+              {selectedStrikeRow.dynamicPricing.adjustments && (
+                <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-5">
+                  <div className="rounded border border-slate-700 bg-slate-900/40 px-2 py-1">
+                    <div className="text-[8px] font-semibold text-slate-400">ROC Factor</div>
+                    <div className="text-xs font-bold text-orange-300">
+                      {selectedStrikeRow.dynamicPricing.adjustments.roc_factor?.toFixed(4)}
+                    </div>
+                    <div className="text-[7px] text-slate-500">
+                      {((selectedStrikeRow.dynamicPricing.adjustments.roc_factor ?? 1 - 1) * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                  <div className="rounded border border-slate-700 bg-slate-900/40 px-2 py-1">
+                    <div className="text-[8px] font-semibold text-slate-400">RSI Factor</div>
+                    <div className="text-xs font-bold text-blue-300">
+                      {selectedStrikeRow.dynamicPricing.adjustments.rsi_factor?.toFixed(4)}
+                    </div>
+                    <div className="text-[7px] text-slate-500">
+                      {((selectedStrikeRow.dynamicPricing.adjustments.rsi_factor ?? 1 - 1) * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                  <div className="rounded border border-slate-700 bg-slate-900/40 px-2 py-1">
+                    <div className="text-[8px] font-semibold text-slate-400">DI Factor</div>
+                    <div className="text-xs font-bold text-purple-300">
+                      {selectedStrikeRow.dynamicPricing.adjustments.di_factor?.toFixed(4)}
+                    </div>
+                    <div className="text-[7px] text-slate-500">
+                      {((selectedStrikeRow.dynamicPricing.adjustments.di_factor ?? 1 - 1) * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                  <div className="rounded border border-slate-700 bg-slate-900/40 px-2 py-1">
+                    <div className="text-[8px] font-semibold text-slate-400">ADX Factor</div>
+                    <div className="text-xs font-bold text-cyan-300">
+                      {selectedStrikeRow.dynamicPricing.adjustments.adx_factor?.toFixed(4)}
+                    </div>
+                    <div className="text-[7px] text-slate-500">
+                      {((selectedStrikeRow.dynamicPricing.adjustments.adx_factor ?? 1 - 1) * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                  <div className="rounded border border-slate-700 bg-slate-900/40 px-2 py-1">
+                    <div className="text-[8px] font-semibold text-slate-400">CHOP Factor</div>
+                    <div className="text-xs font-bold text-green-300">
+                      {selectedStrikeRow.dynamicPricing.adjustments.chop_factor?.toFixed(4)}
+                    </div>
+                    <div className="text-[7px] text-slate-500">
+                      {((selectedStrikeRow.dynamicPricing.adjustments.chop_factor ?? 1 - 1) * 100).toFixed(1)}%
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           ) : null}
         </div>

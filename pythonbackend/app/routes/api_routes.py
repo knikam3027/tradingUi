@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import math
 from datetime import UTC, date, datetime
@@ -27,6 +28,13 @@ from app.models.indicator_model import (
     translate_strike_payload,
 )
 from app.models.market_model import fetch_nifty_chain, fetch_nifty_data, fetch_nifty_intraday
+from app.models.price_calculator import (
+    calculate_roc_adjustment,
+    calculate_rsi_adjustment,
+    calculate_di_adjustment,
+    calculate_adx_adjustment,
+    calculate_chop_adjustment,
+)
 from app.routes.auth_routes import status_payload
 
 
@@ -34,6 +42,7 @@ router = APIRouter()
 
 MARKET_TZ = ZoneInfo("Asia/Kolkata")
 SNAPSHOT_FILE = DATA_DIR / "last-close-strikes.json"
+BOT_HISTORICAL_DIR = DATA_DIR.parents[1] / "My_Algo_Bot" / "historical_data"
 EMPTY_INDICATORS = {"roc": None, "rsi": None, "minusDI": None, "plusDI": None, "adx": None, "chop": None}
 
 
@@ -259,14 +268,19 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
 
         selected_indicators = row_indicators_by_strike.get(atm_strike)
         if not has_indicator_values(selected_indicators):
-            selected_indicators = spot_indicators if requested_center is None else EMPTY_INDICATORS.copy()
+            selected_indicators = (
+                spot_indicators
+                if has_indicator_values(spot_indicators)
+                else EMPTY_INDICATORS.copy()
+            )
+        if not has_indicator_values(selected_indicators):
+            selected_indicators = EMPTY_INDICATORS.copy()
 
         for row in filtered_data:
             ce = row.get("CE") or {}
             pe = row.get("PE") or {}
             strike = row.get("strikePrice")
             row_indicators = row_indicators_by_strike.get(strike)
-            effective_indicators = row_indicators if has_indicator_values(row_indicators) else selected_indicators
             ce_ltp = pick_ltp(ce)
             pe_ltp = pick_ltp(pe)
             ce_open = _to_float(ce.get("openPrice")) or 0
@@ -274,6 +288,13 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
             straddle_open = ce_open + pe_open
             straddle_close = ce_ltp + pe_ltp
             change = round(straddle_close - straddle_open, 2)
+            projected_indicators = load_bot_historical_indicators(strike, straddle_close, straddle_open)
+            fallback_indicators = (
+                selected_indicators
+                if has_indicator_values(selected_indicators)
+                else projected_indicators
+            )
+            effective_indicators = row_indicators if has_indicator_values(row_indicators) else fallback_indicators
 
             ce_iv = _to_float(ce.get("impliedVolatility")) or 0
             pe_iv = _to_float(pe.get("impliedVolatility")) or 0
@@ -332,6 +353,19 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
                 pe_gain,
             )
 
+            # Calculate dynamic pricing based on indicators
+            from app.models.price_calculator import calculate_dynamic_premium
+            dynamic_pricing = calculate_dynamic_premium(
+                ce_close=ce_ltp,
+                pe_close=pe_ltp,
+                roc=effective_indicators.get("roc"),
+                rsi=effective_indicators.get("rsi"),
+                plus_di=effective_indicators.get("plusDI"),
+                minus_di=effective_indicators.get("minusDI"),
+                adx=effective_indicators.get("adx"),
+                chop=effective_indicators.get("chop"),
+            )
+
             raw_rows.append(
                 {
                     "strike": strike,
@@ -358,7 +392,9 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
                     "combinedIV": combined_iv,
                     "combinedDelta": combined_delta,
                     "combinedVolume": combined_volume,
-                    "indicators": row_indicators if has_indicator_values(row_indicators) else EMPTY_INDICATORS.copy(),
+                    "indicators": row_indicators if has_indicator_values(row_indicators) else effective_indicators,
+                    "indicatorSource": "strike_candles" if has_indicator_values(row_indicators) else "bot_price_projected_3m",
+                    "dynamicPricing": dynamic_pricing,
                 }
             )
 
@@ -534,6 +570,10 @@ async def resolve_strike_detail_indicators(strike: float) -> tuple[dict[str, flo
     cached_indicators = select_cached_indicators(cached, strike, allow_global=False)
     if has_indicator_values(cached_indicators):
         return cached_indicators, "cached_strike"
+
+    bot_indicators = load_bot_historical_indicators(strike, ce_close + pe_close, None)
+    if has_indicator_values(bot_indicators):
+        return bot_indicators, "bot_price_projected_3m"
 
     return EMPTY_INDICATORS.copy(), "empty"
 
@@ -789,6 +829,114 @@ def normalize_indicators(indicators: dict[str, Any] | None) -> dict[str, float |
         "adx": _to_float(source.get("adx")),
         "chop": _to_float(source.get("chop")),
     }
+
+
+def load_bot_historical_indicators(
+    strike: float | None = None,
+    current_close: float | None = None,
+    current_open: float | None = None,
+) -> dict[str, float | None]:
+    """
+    Fallback for closed-market/no-candle sessions.
+
+    My_Algo_Bot stores combined straddle candles with already-computed indicator
+    columns. Use the latest row from the requested strike when present; otherwise
+    use the nearest saved strike. This is intentionally marked by callers as a
+    historical source, not live CE/PE candle data.
+    """
+    if not BOT_HISTORICAL_DIR.exists():
+        return EMPTY_INDICATORS.copy()
+
+    csv_files = list(BOT_HISTORICAL_DIR.glob("candles_*_straddle_*.csv"))
+    if not csv_files:
+        return EMPTY_INDICATORS.copy()
+
+    target = _to_float(strike)
+
+    def file_strike(path):
+        parts = path.name.split("_")
+        return _to_float(parts[1]) if len(parts) > 1 else None
+
+    if target is not None:
+        csv_files.sort(
+            key=lambda path: (
+                abs((file_strike(path) or target) - target),
+                path.stat().st_mtime,
+            )
+        )
+    else:
+        csv_files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+    for path in csv_files:
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            if not rows:
+                continue
+            latest = rows[-1]
+            indicators = {
+                "roc": _to_float(latest.get("roc")),
+                "rsi": _to_float(latest.get("rsi")),
+                "minusDI": _to_float(latest.get("di_minus")),
+                "plusDI": _to_float(latest.get("di_plus")),
+                "adx": _to_float(latest.get("adx")),
+                "chop": _to_float(latest.get("chop")),
+            }
+            projected = project_indicators_from_current_price(indicators, latest, current_close, current_open)
+            if has_indicator_values(projected):
+                return projected
+            if has_indicator_values(indicators):
+                return indicators
+        except Exception:
+            continue
+
+    return EMPTY_INDICATORS.copy()
+
+
+def project_indicators_from_current_price(
+    indicators: dict[str, float | None],
+    latest_bot_row: dict[str, Any],
+    current_close: float | None,
+    current_open: float | None = None,
+) -> dict[str, float | None]:
+    close_value = _to_float(current_close)
+    if close_value is None or close_value <= 0 or not has_indicator_values(indicators):
+        return EMPTY_INDICATORS.copy()
+
+    bot_open = _to_float(latest_bot_row.get("open"))
+    bot_close = _to_float(latest_bot_row.get("close"))
+    open_value = _to_float(current_open) or bot_open or close_value
+    if open_value <= 0 or bot_open is None or bot_open <= 0 or bot_close is None or bot_close <= 0:
+        return EMPTY_INDICATORS.copy()
+
+    current_move_pct = ((close_value - open_value) / open_value) * 100
+    bot_move_pct = ((bot_close - bot_open) / bot_open) * 100
+    move_delta = current_move_pct - bot_move_pct
+    trend_force = abs(move_delta)
+    bearish = move_delta < 0
+
+    rsi = _clamp((indicators.get("rsi") or 50) + (move_delta * 2.5), 0, 100)
+    plus_di = indicators.get("plusDI") or 0
+    minus_di = indicators.get("minusDI") or 0
+    if bearish:
+        minus_di += trend_force * 1.4
+        plus_di = max(0, plus_di - trend_force * 0.8)
+    else:
+        plus_di += trend_force * 1.4
+        minus_di = max(0, minus_di - trend_force * 0.8)
+
+    return {
+        "roc": round((indicators.get("roc") or 0) + move_delta, 2),
+        "rsi": round(rsi, 2),
+        "minusDI": round(_clamp(minus_di, 0, 100), 2),
+        "plusDI": round(_clamp(plus_di, 0, 100), 2),
+        "adx": round(_clamp((indicators.get("adx") or 20) + (trend_force * 0.5), 0, 100), 2),
+        "chop": round(_clamp((indicators.get("chop") or 50) - (trend_force * 0.35), 0, 100), 2),
+    }
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 def has_indicator_values(indicators: dict[str, Any] | None) -> bool:

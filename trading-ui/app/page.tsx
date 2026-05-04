@@ -116,8 +116,13 @@ export default function Home() {
           setNiftyPrice(result.data.price);
           setNiftyChange(result.data.change ?? null);
           setNiftyChangePercent(result.data.changePercent ?? null);
-          setConnected(true);
-          localStorage.setItem('hdfc_connected', 'true');
+          const isConn = result.connected ?? false;
+          setConnected(isConn);
+          if (isConn) {
+            localStorage.setItem('hdfc_connected', 'true');
+          } else {
+            localStorage.removeItem('hdfc_connected');
+          }
           setLastUpdated(new Date().toLocaleTimeString('en-IN', { hour12: false }));
         } else {
           const isConn = result.connected ?? false;
