@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import pandas as pd
 from typing import Any
 
@@ -348,7 +349,12 @@ def compute_dmi_series(candles: list[dict[str, Any]], length: int = INDICATOR_LE
         dx[index] = 0 if denominator == 0 else (100 * abs(plus_value - minus_value)) / denominator
 
     dx_for_adx = [0.0 if value is None or not math.isfinite(value) else value for value in dx]
-    return {"diPlus": di_plus, "diMinus": di_minus, "adx": compute_rma_series(dx_for_adx, length)}
+    return {
+        "diPlus": di_plus,
+        "diMinus": di_minus,
+        "dx": dx,
+        "adx": compute_rma_series(dx_for_adx, length),
+    }
 
 
 def compute_chop_series(candles: list[dict[str, Any]], length: int = INDICATOR_LENGTH) -> list[float | None]:
@@ -394,6 +400,7 @@ def calculate_latest_straddle_indicators(
             "vwap": None,
             "rsi": None,
             "roc": None,
+            "dx": None,
             "adx": None,
             "di_plus": None,
             "di_minus": None,
@@ -419,6 +426,7 @@ def calculate_latest_straddle_indicators(
         "vwap": get_last_finite_value(vwap_series),
         "rsi": get_last_finite_value(rsi_series),
         "roc": get_last_finite_value(roc_series),
+        "dx": get_last_finite_value(dmi_series["dx"]),
         "adx": get_last_finite_value(dmi_series["adx"]),
         "di_plus": get_last_finite_value(dmi_series["diPlus"]),
         "di_minus": get_last_finite_value(dmi_series["diMinus"]),
@@ -551,6 +559,7 @@ def calculate_all(price_points: list[Any] | None) -> dict[str, float | None]:
     return {
         "rsi": indicators["rsi"],
         "roc": indicators["roc"],
+        "dx": indicators["dx"],
         "adx": indicators["adx"],
         "plusDI": indicators["di_plus"],
         "minusDI": indicators["di_minus"],
@@ -592,11 +601,12 @@ def to_five_min_candles(candles: list[dict[str, Any]] | None) -> list[dict[str, 
 
 def calculate_all_from_candles(candles: list[dict[str, Any]] | None) -> dict[str, float | None]:
     if not candles:
-        return {"rsi": None, "roc": None, "adx": None, "plusDI": None, "minusDI": None, "chop": None}
+        return {"rsi": None, "roc": None, "dx": None, "adx": None, "plusDI": None, "minusDI": None, "chop": None}
     indicators = calculate_latest_straddle_indicators(candles, INDICATOR_LENGTH, ROC_LENGTH)
     return {
         "rsi": indicators["rsi"],
         "roc": indicators["roc"],
+        "dx": indicators["dx"],
         "adx": indicators["adx"],
         "plusDI": indicators["di_plus"],
         "minusDI": indicators["di_minus"],
@@ -731,8 +741,8 @@ def calc_rsi(df, length=14):
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
 
-    avg_gain = gain.ewm(span=length, adjust=False).mean()
-    avg_loss = loss.ewm(span=length, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
@@ -744,10 +754,10 @@ def calc_roc(df, length=9):
 
 def calc_dmi_adx(df, length=14):
     up_move = df['high'].diff()
-    down_move = df['low'].diff()
+    down_move = -df['low'].diff()
 
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = -down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
     tr = pd.concat([
         df['high'] - df['low'],
@@ -755,12 +765,12 @@ def calc_dmi_adx(df, length=14):
         (df['low'] - df['close'].shift()).abs()
     ], axis=1).max(axis=1)
 
-    atr = tr.rolling(window=length).mean()
-    plus_di = 100 * (plus_dm.rolling(window=length).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(window=length).mean() / atr)
+    atr = tr.ewm(alpha=1/length, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/length, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/length, adjust=False).mean() / atr)
 
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    adx = dx.rolling(window=length).mean()
+    adx = dx.ewm(alpha=1/length, adjust=False).mean()
 
     return plus_di, minus_di, adx
 
@@ -775,5 +785,6 @@ def calc_chop(df, length=14):
     atr = tr.rolling(window=length).sum()
     high_low_range = df['high'].rolling(window=length).max() - df['low'].rolling(window=length).min()
 
-    chop = 100 * (np.log10(atr / high_low_range) / np.log10(length))
+    chop = 100 * np.log10(atr / high_low_range) / np.log10(length)
+    chop = chop.where(high_low_range > 0)
     return chop

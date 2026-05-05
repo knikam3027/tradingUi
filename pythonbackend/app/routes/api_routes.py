@@ -43,7 +43,7 @@ router = APIRouter()
 MARKET_TZ = ZoneInfo("Asia/Kolkata")
 SNAPSHOT_FILE = DATA_DIR / "last-close-strikes.json"
 BOT_HISTORICAL_DIR = DATA_DIR.parents[1] / "My_Algo_Bot" / "historical_data"
-EMPTY_INDICATORS = {"roc": None, "rsi": None, "minusDI": None, "plusDI": None, "adx": None, "chop": None}
+EMPTY_INDICATORS = {"roc": None, "rsi": None, "dx": None, "minusDI": None, "plusDI": None, "adx": None, "chop": None}
 
 
 @router.get("/auth/status")
@@ -118,7 +118,7 @@ async def translate_straddle_series_self_test():
         indicators = (sample or {}).get("indicators") or {}
         passed = all(
             _is_finite(indicators.get(key))
-            for key in ["rsi", "roc", "adx", "di_plus", "di_minus", "chop"]
+            for key in ["rsi", "roc", "dx", "adx", "di_plus", "di_minus", "chop"]
         )
 
         return {"status": "success", "connected": is_connected(), "data": {"passed": passed, "sample": sample}}
@@ -257,6 +257,11 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
         candle_arrays = chain.get("candleArrays") if isinstance(chain.get("candleArrays"), dict) else {}
         row_indicators_by_strike: dict[float, dict[str, float | None]] = {}
         combined_candles_by_strike: dict[float, list[dict[str, Any]]] = {}
+        
+        if candle_arrays:
+            print(f"[DEBUG] candleArrays available with {len(candle_arrays)} symbols: {list(candle_arrays.keys())[:5]}")
+        else:
+            print(f"[DEBUG] NO candleArrays available from chain")
 
         for row in filtered_data:
             strike = row.get("strikePrice")
@@ -632,36 +637,92 @@ def build_combined_premium_candles(
     candle_arrays: dict[str, dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     candle_arrays = candle_arrays or {}
+    strike = option_row.get("strikePrice")
     ce_symbol = ((option_row or {}).get("CE") or {}).get("tradingsymbol")
     pe_symbol = ((option_row or {}).get("PE") or {}).get("tradingsymbol")
     ce_candles = (candle_arrays.get(ce_symbol) or {}).get("candles") if ce_symbol else None
     pe_candles = (candle_arrays.get(pe_symbol) or {}).get("candles") if pe_symbol else None
 
+    if strike == 24100:
+        print(f"[24100] strike={strike}, ce_symbol={ce_symbol}, pe_symbol={pe_symbol}")
+        print(f"[24100] ce_symbol in candle_arrays={ce_symbol in candle_arrays}, pe_symbol in candle_arrays={pe_symbol in candle_arrays}")
+        print(f"[24100] All keys in candle_arrays: {list(candle_arrays.keys())}")
+        print(f"[24100] ce_candles={len(ce_candles) if ce_candles else 0}, pe_candles={len(pe_candles) if pe_candles else 0}")
+
     if not ce_candles or not pe_candles:
         return []
 
+    def parse_date(value: Any) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+
     pe_by_date: dict[str, list[dict[str, Any]]] = {}
+    pe_pending: list[dict[str, Any]] = []
     for candle in pe_candles:
         date_key = candle.get("date")
-        if date_key is None:
-            continue
-        pe_by_date.setdefault(date_key, []).append(candle)
+        if date_key is not None:
+            pe_by_date.setdefault(date_key, []).append(candle)
+        pe_pending.append(candle)
 
     combined: list[dict[str, Any]] = []
+    match_count = 0
+    fallback_count = 0
     for index, ce in enumerate(ce_candles):
-        pe_candidates = pe_by_date.get(ce.get("date")) or []
-        pe = pe_candidates.pop(0) if pe_candidates else None
+        pe = None
+        ce_date = ce.get("date")
+        if ce_date is not None:
+            candidates = pe_by_date.get(ce_date) or []
+            if candidates:
+                pe = candidates.pop(0)
+                if pe in pe_pending:
+                    pe_pending.remove(pe)
+                match_count += 1
+
+        if pe is None and pe_pending:
+            ce_ts = parse_date(ce_date)
+            if ce_ts is not None:
+                nearest_index = None
+                nearest_delta = None
+                for idx, cand in enumerate(pe_pending):
+                    cand_ts = parse_date(cand.get("date"))
+                    if cand_ts is None:
+                        continue
+                    delta = abs((cand_ts - ce_ts).total_seconds())
+                    if nearest_delta is None or delta < nearest_delta:
+                        nearest_delta = delta
+                        nearest_index = idx
+                if nearest_index is not None and nearest_delta is not None and nearest_delta <= 120:
+                    pe = pe_pending.pop(nearest_index)
+                    fallback_count += 1
+
         if pe is None and len(pe_candles) == len(ce_candles):
             pe = pe_candles[index]
+            if pe in pe_pending:
+                pe_pending.remove(pe)
+            fallback_count += 1
+
         if not pe:
             continue
 
         try:
             combined.append(build_straddle_candle({"ce": ce, "pe": pe, "datetime": ce.get("date")}))
-        except ValueError:
+        except ValueError as e:
+            if strike == 24100:
+                print(f"[STRIKE 24100] build_straddle_candle error: {e}")
             continue
 
+    if strike == 24100:
+        print(f"[STRIKE 24100] Combined candles: {len(combined)} (exact_match={match_count}, fallback={fallback_count})")
+
     return combined
+
 
 
 def calculate_combined_iv(
@@ -824,6 +885,7 @@ def normalize_indicators(indicators: dict[str, Any] | None) -> dict[str, float |
     return {
         "roc": _to_float(source.get("roc")),
         "rsi": _to_float(source.get("rsi")),
+        "dx": _to_float(source.get("dx", source.get("di_dx"))),
         "minusDI": _to_float(source.get("minusDI", source.get("di_minus"))),
         "plusDI": _to_float(source.get("plusDI", source.get("di_plus"))),
         "adx": _to_float(source.get("adx")),
@@ -877,6 +939,7 @@ def load_bot_historical_indicators(
             indicators = {
                 "roc": _to_float(latest.get("roc")),
                 "rsi": _to_float(latest.get("rsi")),
+                "dx": _to_float(latest.get("dx")),
                 "minusDI": _to_float(latest.get("di_minus")),
                 "plusDI": _to_float(latest.get("di_plus")),
                 "adx": _to_float(latest.get("adx")),
@@ -928,6 +991,7 @@ def project_indicators_from_current_price(
     return {
         "roc": round((indicators.get("roc") or 0) + move_delta, 2),
         "rsi": round(rsi, 2),
+        "dx": round(_clamp((indicators.get("dx") or 20) + (trend_force * 0.3), 0, 100), 2),
         "minusDI": round(_clamp(minus_di, 0, 100), 2),
         "plusDI": round(_clamp(plus_di, 0, 100), 2),
         "adx": round(_clamp((indicators.get("adx") or 20) + (trend_force * 0.5), 0, 100), 2),

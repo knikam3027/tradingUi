@@ -54,7 +54,7 @@ export default function Home() {
   const [qtpDragging, setQtpDragging] = useState(false);
   const [qtpDragOffset, setQtpDragOffset] = useState({ x: 0, y: 0 });
   const qtpRef = useRef<HTMLDivElement>(null);
-  const [mounted, setMounted] = useState(false);
+  const [mounted, setMounted] = useState(() => typeof window !== 'undefined');
   const containerRef = useRef<HTMLDivElement>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState('NIFTY');
@@ -67,12 +67,8 @@ export default function Home() {
   const [niftyPrice, setNiftyPrice] = useState<number | null>(null);
   const [niftyChange, setNiftyChange] = useState<number | null>(null);
   const [niftyChangePercent, setNiftyChangePercent] = useState<number | null>(null);
-  const [connected, setConnected] = useState(false);
+  const [connected, setConnected] = useState<boolean>(() => typeof window !== 'undefined' && localStorage.getItem('hdfc_connected') === 'true');
   const [lastUpdated, setLastUpdated] = useState('');
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
 
   // Handle HDFC Sky OAuth callback: ?requestToken=xxx lands on this page
   useEffect(() => {
@@ -99,11 +95,26 @@ export default function Home() {
       .catch((err) => console.error('Token exchange error:', err));
   }, []);
 
-  // Restore connected state from localStorage on load
+  // Check broker auth connection directly
   useEffect(() => {
-    if (localStorage.getItem('hdfc_connected') === 'true') {
-      setConnected(true);
-    }
+    const checkAuthStatus = async () => {
+      try {
+        const res = await fetch('/auth/status');
+        const result = await res.json();
+        const isConn = result.connected ?? false;
+        setConnected(isConn);
+        if (isConn) {
+          localStorage.setItem('hdfc_connected', 'true');
+        } else {
+          localStorage.removeItem('hdfc_connected');
+        }
+      } catch (error) {
+        console.error('Error checking auth status:', error);
+        setConnected(false);
+        localStorage.removeItem('hdfc_connected');
+      }
+    };
+    checkAuthStatus();
   }, []);
 
   // Fetch live NIFTY price
@@ -116,21 +127,10 @@ export default function Home() {
           setNiftyPrice(result.data.price);
           setNiftyChange(result.data.change ?? null);
           setNiftyChangePercent(result.data.changePercent ?? null);
-          const isConn = result.connected ?? false;
-          setConnected(isConn);
-          if (isConn) {
-            localStorage.setItem('hdfc_connected', 'true');
-          } else {
-            localStorage.removeItem('hdfc_connected');
-          }
           setLastUpdated(new Date().toLocaleTimeString('en-IN', { hour12: false }));
-        } else {
-          const isConn = result.connected ?? false;
-          setConnected(isConn);
-          if (!isConn) localStorage.removeItem('hdfc_connected');
         }
-      } catch {
-        setConnected(false);
+      } catch (error) {
+        console.error('Error fetching NIFTY price:', error);
       }
     };
     fetchNifty();
@@ -176,12 +176,6 @@ export default function Home() {
   }, [qtpDragging, qtpDragOffset]);
 
   // Reset QTP position when popup opens
-  useEffect(() => {
-    if (showQTPPopup) {
-      setQtpPosition({ x: window.innerWidth / 2 - 350, y: window.innerHeight / 2 - 250 });
-    }
-  }, [showQTPPopup]);
-
   const handleMouseDown = (e: React.MouseEvent) => {
     if (!isResizable) return;
     setIsDragging(true);
@@ -355,7 +349,10 @@ export default function Home() {
 
           {/* QTP Button */}
           <button 
-            onClick={() => setShowQTPPopup(true)}
+            onClick={() => {
+              setQtpPosition({ x: window.innerWidth / 2 - 350, y: window.innerHeight / 2 - 250 });
+              setShowQTPPopup(true);
+            }}
             className="px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded text-sm transition-colors flex items-center gap-2"
           >
             🎯 QTP

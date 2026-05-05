@@ -53,11 +53,14 @@ async def get_indicators():
     plus_di, minus_di, adx = calc_dmi_adx(df)
     chop = calc_chop(df)
 
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+
     return {
         "RSI": rsi.iloc[-1],
         "ROC": roc.iloc[-1],
         "+DI": plus_di.iloc[-1],
         "-DI": minus_di.iloc[-1],
+        "DX": dx.iloc[-1],
         "ADX": adx.iloc[-1],
         "CHOP": chop.iloc[-1]
     }

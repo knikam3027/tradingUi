@@ -141,3 +141,8 @@ async def status_payload():
         "broker": "HDFC Sky",
         "tokenId": "active" if get_token_id_value() else None,
     }
+
+
+@router.get("/status")
+async def status():
+    return await status_payload()
