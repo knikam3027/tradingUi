@@ -24,11 +24,15 @@ MASTER_TTL = 6 * 60 * 60 * 1000
 master_cache: dict[str, Any] | None = None
 
 
-def handle_hdfc_auth_error(status: int, context: str) -> None:
+def handle_hdfc_auth_error(status: int, context: str, clear_token: bool = True) -> None:
     if status in {401, 403}:
-        print(f"HDFC Sky: {context} returned {status} - token expired, disconnecting")
-        set_access_token(None)
-        raise RuntimeError(f"HDFC Sky token expired ({status}) - please re-login at /auth/login")
+        action = "disconnecting" if clear_token else "keeping token"
+        print(f"HDFC Sky: {context} returned {status} - {action}")
+        if clear_token:
+            set_access_token(None)
+        # Let callers fall back to NSE without turning an expired auth token into
+        # a repeated terminal exception on every poll.
+        raise PermissionError(f"HDFC Sky token expired ({status})")
 
 
 def hdfc_headers() -> dict[str, str]:
@@ -188,7 +192,10 @@ async def get_nifty_option_tokens(target_strikes: list[float] | None = None) -> 
     return token_map
 
 
-async def fetch_ltp(tokens: list[dict[str, str]]) -> dict[str, dict[str, float]]:
+async def fetch_ltp(
+    tokens: list[dict[str, str]],
+    clear_on_auth_error: bool = True,
+) -> dict[str, dict[str, float]]:
     if not tokens:
         return {}
 
@@ -202,7 +209,11 @@ async def fetch_ltp(tokens: list[dict[str, str]]) -> dict[str, dict[str, float]]
             response = await client.put(url, headers=hdfc_headers(), json={"data": batch})
 
         if response.status_code >= 400:
-            handle_hdfc_auth_error(response.status_code, "fetch-ltp")
+            handle_hdfc_auth_error(
+                response.status_code,
+                "fetch-ltp",
+                clear_token=clear_on_auth_error,
+            )
             print(f"fetch-ltp failed: status={response.status_code}, response={response.text[:500]}")
             raise RuntimeError(f"fetch-ltp {response.status_code}: {response.text}")
 
@@ -265,7 +276,12 @@ async def _fetch_candle_once(
         response = await client.get(url, headers={"Authorization": get_access_token() or "", "User-Agent": USER_AGENT})
 
     if response.status_code >= 400:
-        handle_hdfc_auth_error(response.status_code, "fetch-candle")
+        try:
+            handle_hdfc_auth_error(response.status_code, "fetch-candle", clear_token=False)
+        except PermissionError as err:
+            raise RuntimeError(str(err))
+        if response.status_code == 422 and "static ip not present" in response.text.lower():
+            raise RuntimeError("fetch-candle unavailable: static ip not present")
         print(f"fetch-candle failed: status={response.status_code}, response={response.text[:500]}")
         raise RuntimeError(f"fetch-candle {response.status_code}: {response.text}")
 
@@ -325,27 +341,10 @@ async def fetch_nifty_option_chain(
             token_to_strike[str(info["peToken"])] = {"strike": strike, "type": "PE"}
 
     ltp_map = await fetch_ltp(ltp_tokens)
+    if ltp_tokens and not ltp_map:
+        raise RuntimeError("HDFC Sky LTP data unavailable")
 
-    candle_data_map: dict[str, dict[str, Any]] = {}
-    candle_symbols: list[dict[str, str]] = []
-    for strike in selected_strikes:
-        info = all_tokens.get(strike) or {}
-        if info.get("ceSymbol"):
-            candle_symbols.append({"symbol": info["ceSymbol"], "key": info["ceSymbol"]})
-        if info.get("peSymbol"):
-            candle_symbols.append({"symbol": info["peSymbol"], "key": info["peSymbol"]})
-
-    candle_batch = 2
-    for index in range(0, len(candle_symbols), candle_batch):
-        batch = candle_symbols[index : index + candle_batch]
-        await asyncio.gather(
-            *[
-                _fetch_and_store_candle(symbol_info["symbol"], symbol_info["key"], candle_data_map)
-                for symbol_info in batch
-            ]
-        )
-        if index + candle_batch < len(candle_symbols):
-            await asyncio.sleep(0.3)
+    candle_data_map = await fetch_option_candle_map(selected_strikes, all_tokens)
 
     data: list[dict[str, Any]] = []
     for strike in selected_strikes:
@@ -402,6 +401,54 @@ async def fetch_nifty_option_chain(
     }
 
 
+async def fetch_option_candle_map(
+    selected_strikes: list[float],
+    all_tokens: dict[float, dict[str, Any]],
+    timeout_seconds: float = 2.0,
+) -> dict[str, dict[str, Any]]:
+    candle_data_map: dict[str, dict[str, Any]] = {}
+    candle_symbols: list[dict[str, str]] = []
+    for strike in selected_strikes:
+        info = all_tokens.get(strike) or {}
+        if info.get("ceSymbol"):
+            candle_symbols.append({"symbol": info["ceSymbol"], "key": info["ceSymbol"]})
+        if info.get("peSymbol"):
+            candle_symbols.append({"symbol": info["peSymbol"], "key": info["peSymbol"]})
+
+    if not candle_symbols:
+        return candle_data_map
+
+    try:
+        await asyncio.wait_for(
+            _populate_option_candles(candle_symbols, candle_data_map),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        print("HDFC Sky candle fetch timed out; continuing with live LTP data")
+    except Exception as err:
+        print(f"HDFC Sky candle fetch unavailable; continuing with live LTP data: {err}")
+
+    return candle_data_map
+
+
+async def _populate_option_candles(
+    candle_symbols: list[dict[str, str]],
+    candle_data_map: dict[str, dict[str, Any]],
+) -> None:
+    candle_batch = 2
+    for index in range(0, len(candle_symbols), candle_batch):
+        batch = candle_symbols[index : index + candle_batch]
+        await asyncio.gather(
+            *[
+                _fetch_and_store_candle(symbol_info["symbol"], symbol_info["key"], candle_data_map)
+                for symbol_info in batch
+            ],
+            return_exceptions=True,
+        )
+        if index + candle_batch < len(candle_symbols):
+            await asyncio.sleep(0.3)
+
+
 async def _fetch_and_store_candle(symbol: str, key: str, candle_data_map: dict[str, dict[str, Any]]) -> None:
     try:
         candles = await fetch_candle(symbol, "NFO", "XX", "MINUTE5")
@@ -410,6 +457,31 @@ async def _fetch_and_store_candle(symbol: str, key: str, candle_data_map: dict[s
             candle_data_map[key] = {"open": candles[0].get("open") or 0, "volume": total_volume, "candles": candles}
     except Exception:
         pass
+
+
+async def fetch_nifty_reference_price() -> float | None:
+    instruments = await get_security_master()
+    now = datetime.now(UTC).date()
+    nifty_futs = []
+    for instrument in instruments:
+        if not (
+            instrument["exchange"] == "NFO"
+            and instrument["name"] == "NIFTY"
+            and instrument["instrumentType"] == "FUTIDX"
+        ):
+            continue
+        expiry = _parse_iso_date(parse_expiry(instrument["expiry"]))
+        if expiry and expiry >= now:
+            nifty_futs.append({**instrument, "expiryDate": expiry})
+
+    nifty_futs.sort(key=lambda item: item["expiryDate"])
+    if not nifty_futs:
+        return None
+
+    token = str(nifty_futs[0]["token"])
+    ltp_map = await fetch_ltp([{"exchange": "NFO", "token": token}], clear_on_auth_error=False)
+    ltp = _to_float((ltp_map.get(token) or {}).get("ltp"))
+    return ltp if ltp and ltp > 0 else None
 
 
 async def fetch_nifty_intraday() -> list[list[float]] | None:

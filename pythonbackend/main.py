@@ -7,6 +7,7 @@ from app.config import CORS_ORIGINS, PORT
 from app.models.auth_model import is_connected, load_persisted_token
 from app.routes.api_routes import router as api_router
 from app.routes.auth_routes import router as auth_router
+from app.routes.ws_routes import router as ws_router
 from app.models.indicator_model import calc_rsi, calc_roc, calc_dmi_adx, calc_chop
 
 
@@ -24,6 +25,7 @@ app.add_middleware(
 
 app.include_router(auth_router, prefix="/auth")
 app.include_router(api_router, prefix="/api/v1")
+app.include_router(ws_router, prefix="/ws")
 
 
 @app.get("/")
@@ -34,7 +36,6 @@ async def health_check():
         "broker": "HDFC Sky",
         "connected": is_connected(),
     }
-
 
 @app.get("/indicators")
 async def get_indicators():

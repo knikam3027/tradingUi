@@ -14,6 +14,7 @@ from app.models.auth_model import get_access_token, is_connected
 from app.models.hdfc_sky_model import (
     fetch_nifty_intraday as fetch_hdfc_intraday,
     fetch_nifty_option_chain,
+    fetch_nifty_reference_price,
 )
 from app.models.indicator_model import (
     build_straddle_candle,
@@ -137,11 +138,23 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
 
         if is_connected() and get_access_token():
             try:
-                spot_price = (cached or {}).get("spotPrice")
+                spot_price = _to_float((cached or {}).get("spotPrice"))
+                has_live_spot = False
                 try:
-                    nifty = await fetch_nifty_data()
+                    hdfc_reference_price = await asyncio.wait_for(fetch_nifty_reference_price(), timeout=2)
+                    if hdfc_reference_price:
+                        spot_price = hdfc_reference_price
+                        has_live_spot = True
+                except Exception as spot_err:
+                    print(f"HDFC Sky reference price unavailable: {spot_err}")
+
+                try:
+                    nifty = await asyncio.wait_for(fetch_nifty_data(), timeout=2)
                     if nifty and nifty.get("lastPrice"):
-                        spot_price = nifty["lastPrice"]
+                        nse_spot = _to_float(nifty["lastPrice"])
+                        if nse_spot is not None:
+                            spot_price = nse_spot
+                            has_live_spot = True
                 except Exception:
                     pass
 
@@ -152,10 +165,13 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
                 if hdfc_chain.get("data"):
                     chain = hdfc_chain
                     data_source = "hdfc_sky"
-                try:
-                    intraday = await asyncio.wait_for(fetch_nifty_intraday(), timeout=6)
-                except Exception as intraday_err:
-                    print(f"NSE intraday fetch failed while using HDFC chain: {intraday_err}")
+                    if has_live_spot:
+                        intraday = None
+                    else:
+                        try:
+                            intraday = await asyncio.wait_for(fetch_nifty_intraday(), timeout=1)
+                        except Exception as intraday_err:
+                            print(f"NSE intraday fetch failed while using HDFC chain: {intraday_err}")
             except Exception as hdfc_err:
                 print(f"HDFC Sky fetch failed, falling back to NSE: {hdfc_err}")
 
@@ -168,9 +184,9 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
                     print(f"NSE intraday fetch failed while using NSE chain: {intraday_err}")
             data_source = "nse"
 
-        if not intraday and is_connected() and get_access_token():
+        if not intraday and data_source != "hdfc_sky" and is_connected() and get_access_token():
             try:
-                intraday = await fetch_hdfc_intraday()
+                intraday = await asyncio.wait_for(fetch_hdfc_intraday(), timeout=3)
             except Exception:
                 pass
 
@@ -257,11 +273,6 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
         candle_arrays = chain.get("candleArrays") if isinstance(chain.get("candleArrays"), dict) else {}
         row_indicators_by_strike: dict[float, dict[str, float | None]] = {}
         combined_candles_by_strike: dict[float, list[dict[str, Any]]] = {}
-        
-        if candle_arrays:
-            print(f"[DEBUG] candleArrays available with {len(candle_arrays)} symbols: {list(candle_arrays.keys())[:5]}")
-        else:
-            print(f"[DEBUG] NO candleArrays available from chain")
 
         for row in filtered_data:
             strike = row.get("strikePrice")
@@ -271,7 +282,8 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
             if has_indicator_values(row_indicators):
                 row_indicators_by_strike[strike] = row_indicators
 
-        selected_indicators = row_indicators_by_strike.get(atm_strike)
+        selected_indicator_strike = requested_center if requested_center is not None else atm_strike
+        selected_indicators = row_indicators_by_strike.get(selected_indicator_strike)
         if not has_indicator_values(selected_indicators):
             selected_indicators = (
                 spot_indicators
@@ -422,7 +434,7 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
                 {
                     "spotPrice": spot,
                     "atmStrike": atm_strike,
-                    "selectedStrike": atm_strike,
+                    "selectedStrike": selected_indicator_strike,
                     "expiry": nearest_expiry,
                     "daysToExpiry": days_to_expiry,
                     "strikes": strikes,
@@ -437,7 +449,7 @@ async def nifty_strikes(selected_strike: str | None = Query(default=None, alias=
             "data": {
                 "spotPrice": spot,
                 "atmStrike": atm_strike,
-                "selectedStrike": atm_strike,
+                "selectedStrike": selected_indicator_strike,
                 "expiry": nearest_expiry,
                 "daysToExpiry": days_to_expiry,
                 "strikes": strikes,
@@ -643,12 +655,6 @@ def build_combined_premium_candles(
     ce_candles = (candle_arrays.get(ce_symbol) or {}).get("candles") if ce_symbol else None
     pe_candles = (candle_arrays.get(pe_symbol) or {}).get("candles") if pe_symbol else None
 
-    if strike == 24100:
-        print(f"[24100] strike={strike}, ce_symbol={ce_symbol}, pe_symbol={pe_symbol}")
-        print(f"[24100] ce_symbol in candle_arrays={ce_symbol in candle_arrays}, pe_symbol in candle_arrays={pe_symbol in candle_arrays}")
-        print(f"[24100] All keys in candle_arrays: {list(candle_arrays.keys())}")
-        print(f"[24100] ce_candles={len(ce_candles) if ce_candles else 0}, pe_candles={len(pe_candles) if pe_candles else 0}")
-
     if not ce_candles or not pe_candles:
         return []
 
@@ -713,13 +719,8 @@ def build_combined_premium_candles(
 
         try:
             combined.append(build_straddle_candle({"ce": ce, "pe": pe, "datetime": ce.get("date")}))
-        except ValueError as e:
-            if strike == 24100:
-                print(f"[STRIKE 24100] build_straddle_candle error: {e}")
+        except ValueError:
             continue
-
-    if strike == 24100:
-        print(f"[STRIKE 24100] Combined candles: {len(combined)} (exact_match={match_count}, fallback={fallback_count})")
 
     return combined
 

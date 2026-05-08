@@ -476,6 +476,30 @@ function centerStrikeRows(rows: StrikeRow[], centerStrike: number | null, radius
   return rows.slice(start, end).slice(0, windowSize);
 }
 
+function resolveNearestStrike(
+  rows: StrikeRow[],
+  spotPrice?: string | number | null,
+  fallback?: number | null
+) {
+  const numericSpot = spotPrice === null || spotPrice === undefined ? null : Number(spotPrice);
+  const strikes = rows
+    .map((row) => Number(row.strike))
+    .filter((strike) => Number.isFinite(strike));
+
+  if (numericSpot !== null && Number.isFinite(numericSpot) && strikes.length > 0) {
+    return strikes.reduce((nearest, strike) => (
+      Math.abs(strike - numericSpot) < Math.abs(nearest - numericSpot) ? strike : nearest
+    ), strikes[0]);
+  }
+
+  if (fallback !== null && fallback !== undefined && Number.isFinite(fallback)) {
+    return fallback;
+  }
+
+  const atm = rows.find((row) => row.isATM);
+  return atm ? Number(atm.strike) : null;
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
@@ -532,6 +556,19 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   const [loading, setLoading] = useState(true);
   const [strikeLevelIndicators, setStrikeLevelIndicators] = useState<Indicators | null>(null);
   const [strikeLevelIndicatorSource, setStrikeLevelIndicatorSource] = useState<string | null>(null);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [manualStrikeSelection, setManualStrikeSelection] = useState(false);
+
+  const getBackendWebSocketUrl = (strike: number | null) => {
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+    const wsUrl = new URL(backendUrl);
+    wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl.pathname = '/ws/market/strikes';
+    if (strike !== null) {
+      wsUrl.searchParams.set('selectedStrike', String(strike));
+    }
+    return wsUrl.toString();
+  };
 
   useEffect(() => {
     setMounted(true);
@@ -554,7 +591,11 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
       if (cached?.strikes?.length) {
         setStrikeData(cached.strikes);
       }
-      const cachedSelectedStrike = Number(cached?.selectedStrike ?? cached?.strikes?.find((row) => row.isATM)?.strike);
+      const cachedSelectedStrike = resolveNearestStrike(
+        cached?.strikes || [],
+        cached?.spotPrice,
+        Number(cached?.selectedStrike ?? cached?.strikes?.find((row) => row.isATM)?.strike)
+      );
       if (Number.isFinite(cachedSelectedStrike)) {
         setSelectedStrike(cachedSelectedStrike);
       }
@@ -574,7 +615,9 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   useEffect(() => {
     const fetchStrikes = async () => {
       try {
-        const query = selectedStrike !== null ? `?selectedStrike=${encodeURIComponent(String(selectedStrike))}` : '';
+        const query = manualStrikeSelection && selectedStrike !== null
+          ? `?selectedStrike=${encodeURIComponent(String(selectedStrike))}`
+          : '';
         const res = await fetch(`/api/market/strikes${query}`);
         const result = await res.json();
         setBackendConnected(result.connected ?? false);
@@ -596,7 +639,13 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
           if (result.data.spotPrice !== null && result.data.spotPrice !== undefined) {
             setSpotPrice(String(result.data.spotPrice));
           }
-          const resolvedSelectedStrike = Number(result.data.selectedStrike ?? result.data.atmStrike);
+          const resolvedSelectedStrike = manualStrikeSelection
+            ? Number(result.data.selectedStrike ?? result.data.atmStrike)
+            : resolveNearestStrike(
+                result.data.strikes || [],
+                result.data.spotPrice,
+                Number(result.data.selectedStrike ?? result.data.atmStrike)
+              );
           if (Number.isFinite(resolvedSelectedStrike)) {
             setSelectedStrike(resolvedSelectedStrike);
           }
@@ -609,7 +658,13 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                   strikes: result.data.strikes,
                   indicators: result.data.indicators || {},
                   spotPrice: result.data.spotPrice ?? null,
-                  selectedStrike: result.data.selectedStrike ?? result.data.atmStrike ?? selectedStrike,
+                  selectedStrike: manualStrikeSelection
+                    ? result.data.selectedStrike ?? result.data.atmStrike ?? selectedStrike
+                    : resolveNearestStrike(
+                        result.data.strikes || [],
+                        result.data.spotPrice,
+                        Number(result.data.selectedStrike ?? result.data.atmStrike ?? selectedStrike)
+                      ),
                   expiry: result.data.expiry ?? null,
                   cachedAt: result.data.cachedAt ?? null,
                   fallbackSource,
@@ -642,7 +697,86 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
     fetchStrikes();
     const interval = setInterval(fetchStrikes, 5000);
     return () => clearInterval(interval);
-  }, [selectedStrike]);
+  }, [selectedStrike, manualStrikeSelection]);
+
+  // Live websocket updates for strike data
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const webSocketUrl = getBackendWebSocketUrl(manualStrikeSelection ? selectedStrike : null);
+    const socket = new WebSocket(webSocketUrl);
+    let reconnectTimer: NodeJS.Timeout | null = null;
+
+    socket.onopen = () => {
+      setWsConnected(true);
+      console.debug('Connected to strike websocket', webSocketUrl);
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.status !== 'success' || !message.data) {
+          return;
+        }
+
+        const payload = message.data;
+        if (payload.spotPrice !== undefined && payload.spotPrice !== null) {
+          setSpotPrice(String(payload.spotPrice));
+        }
+        if (Array.isArray(payload.strikes)) {
+          setStrikeData(payload.strikes);
+        }
+        if (payload.selectedStrike !== undefined && payload.selectedStrike !== null && !manualStrikeSelection) {
+          const nextStrike = resolveNearestStrike(
+            Array.isArray(payload.strikes) ? payload.strikes : strikeData,
+            payload.spotPrice,
+            Number(payload.selectedStrike)
+          );
+          if (Number.isFinite(nextStrike)) {
+            setSelectedStrike(nextStrike);
+          }
+        }
+        if (payload.indicators) {
+          setIndicators({ ...EMPTY_INDICATORS, ...payload.indicators });
+        }
+        if (payload.marketOpen !== undefined) {
+          setMarketOpen(Boolean(payload.marketOpen));
+        }
+        if (message.connected !== undefined) {
+          setBackendConnected(Boolean(message.connected));
+        }
+        if (payload.fallbackSource) {
+          setIndicatorSource(String(payload.fallbackSource));
+        }
+      } catch (err) {
+        console.error('Invalid strike websocket payload', err);
+      }
+    };
+
+    socket.onclose = () => {
+      setWsConnected(false);
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      reconnectTimer = setTimeout(() => {
+        setWsConnected(false);
+      }, 5000);
+    };
+
+    socket.onerror = (error) => {
+      console.error('Strike websocket error:', error);
+      setWsConnected(false);
+    };
+
+    return () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      socket.close();
+    };
+  }, [selectedStrike, manualStrikeSelection, strikeData]);
 
   // Fetch strike-level indicators when strike is selected
   useEffect(() => {
@@ -714,7 +848,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
     ? strikeData.find((row) => Number(row.strike) === selectedStrike)
     : strikeData.find((row) => row.isATM);
   const selectedRowIndicators = selectedStrikeRow?.indicators;
-  const selectedRowIndicatorSource = selectedStrikeRow?.indicatorSource || indicatorSource || 'bot_historical';
+  const selectedRowIndicatorSource = selectedStrikeRow?.indicatorSource || strikeLevelIndicatorSource || indicatorSource || 'bot_historical';
   const hasSelectedRowIndicators = hasIndicatorValues(selectedRowIndicators);
   const hasStrikeLevelIndicators = hasIndicatorValues(strikeLevelIndicators);
   const hasUsableStrikeLevelIndicators =
@@ -781,11 +915,11 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
   return (
     <div className={`border border-gray-700 bg-[#020617] rounded-md overflow-hidden ${className}`}>
       <div className="overflow-x-auto">
-        <table className="w-full text-[10px] border-collapse">
+        <table className="w-full text-[11px] border-collapse">
           <thead className="bg-[#1d4ed8]">
             <tr>
               {["STRIKE", "C.IV", "IV CHG", "OPEN", "LTP", "CE", "PE", "CHANGE", "LEAD", "NET DELTA", "VOL SURGE", "REGIME", "IND.REG", "T.MODE", "T.TYPE", "MANUAL"].map(h => (
-                <th key={h} className="px-1 py-1 text-left font-bold text-white border-r border-blue-900 whitespace-nowrap">
+                <th key={h} className="px-2 py-2 text-left font-bold text-white border-r border-blue-900 whitespace-nowrap">
                   {h}
                 </th>
               ))}
@@ -804,39 +938,42 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
               return (
               <tr
                 key={i}
-                onClick={() => setSelectedStrike(Number(row.strike))}
+                onClick={() => {
+                  setManualStrikeSelection(true);
+                  setSelectedStrike(Number(row.strike));
+                }}
                 className={`cursor-pointer border-t border-gray-800 transition-colors ${isSelectedCenter ? 'bg-yellow-900/40 border-yellow-600' : 'hover:bg-gray-800/50'}`}
               >
-                <td className={`px-1 py-1 font-mono ${isSelectedCenter ? 'text-yellow-300 font-bold' : 'text-gray-400'}`}>{row.strike}</td>
-                <td className="px-1 py-1 text-purple-400 font-semibold">{row.cIV}</td>
-                <td className={`px-1 py-1 font-semibold ${signedValueClass(row.ivChange)}`}>
+                <td className={`px-2 py-2 font-mono ${isSelectedCenter ? 'text-yellow-300 font-bold text-base' : 'text-gray-400'}`}>{row.strike}</td>
+                <td className="px-2 py-2 text-purple-400 font-semibold">{row.cIV}</td>
+                <td className={`px-2 py-2 font-semibold ${signedValueClass(row.ivChange)}`}>
                   {formatSignedValue(row.ivChange, 2)}
                 </td>
-                <td className="px-1 py-1 text-gray-400">{row.open}</td>
-                <td className="px-1 py-1 font-bold text-white">{row.ltp}</td>
-                <td className="px-1 py-1 text-blue-300 font-semibold">{row.ce}</td>
-                <td className="px-1 py-1 text-red-300 font-semibold">{row.pe}</td>
-                <td className={`px-1 py-1 font-bold ${row.change >= 0 ? "text-green-400" : "text-red-400"}`}>
+                <td className="px-2 py-2 text-gray-400">{row.open}</td>
+                <td className={`px-2 py-2 font-bold text-white ${isSelectedCenter ? 'text-base' : ''}`}>{row.ltp}</td>
+                <td className="px-2 py-2 text-blue-300 font-semibold">{row.ce}</td>
+                <td className="px-2 py-2 text-red-300 font-semibold">{row.pe}</td>
+                <td className={`px-2 py-2 font-bold ${row.change >= 0 ? "text-green-400" : "text-red-400"}`}>
                   {row.change >= 0 ? '+' : ''}{row.change}
                 </td>
-                <td className="px-1 py-1 text-orange-400">
+                <td className="px-2 py-2 text-orange-400">
                   {row.lead}
                 </td>
-                <td className={`px-1 py-1 font-semibold ${signedValueClass(row.netDelta ?? row.cDelta)}`}>
+                <td className={`px-2 py-2 font-semibold ${signedValueClass(row.netDelta ?? row.cDelta)}`}>
                   {formatSignedValue(row.netDelta ?? row.cDelta, 2)}
                 </td>
-                <td className={`px-1 py-1 ${volumeSurgeClass(row.volumeSurge)}`}>
+                <td className={`px-2 py-2 ${volumeSurgeClass(row.volumeSurge)}`}>
                   {formatMultiplier(row.volumeSurge)}
                 </td>
-                <td className={`px-1 py-1 font-bold text-center ${row.regime === 'BEARISH' ? 'text-red-400' : row.regime === 'SHORT COV' ? 'text-orange-400' : row.regime === 'BULLISH' ? 'text-green-400' : 'text-gray-400'}`}>
+                <td className={`px-2 py-2 font-bold text-center ${row.regime === 'BEARISH' ? 'text-red-400' : row.regime === 'SHORT COV' ? 'text-orange-400' : row.regime === 'BULLISH' ? 'text-green-400' : 'text-gray-400'}`}>
                   {row.regime}
                 </td>
-                <td className={`px-1 py-1 font-semibold ${row.indReg === 'Bullish' ? 'text-green-400' : row.indReg === 'Bearish' ? 'text-red-400' : row.indReg === 'Neutral' ? 'text-yellow-400' : 'text-gray-400'}`}>{row.indReg}</td>
-                <td className="px-1 py-1 text-blue-400 font-semibold">{row.tMode}</td>
-                <td className="px-1 py-1 text-green-400 font-semibold">{row.tType}</td>
+                <td className={`px-2 py-2 font-semibold ${row.indReg === 'Bullish' ? 'text-green-400' : row.indReg === 'Bearish' ? 'text-red-400' : row.indReg === 'Neutral' ? 'text-yellow-400' : 'text-gray-400'}`}>{row.indReg}</td>
+                <td className="px-2 py-2 text-blue-400 font-semibold">{row.tMode}</td>
+                <td className="px-2 py-2 text-green-400 font-semibold">{row.tType}</td>
 
                 {/* MANUAL Column */}
-                <td className="px-1 py-1">
+                <td className="px-2 py-2">
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
@@ -848,7 +985,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
                       });
                       setShowManualPopup(true);
                     }}
-                    className="px-2 py-0.5 bg-green-600 hover:bg-green-700 text-white text-[10px] font-bold rounded transition-colors"
+                    className="px-2 py-1 bg-green-600 hover:bg-green-700 text-white text-[10px] font-bold rounded transition-colors"
                   >
                     Trade
                   </button>
@@ -874,7 +1011,7 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
         )}
 
         {/* Indicators Footer */}
-        <div className="border-t border-gray-700 bg-[#020617] text-[11px] px-3 py-2">
+        <div className="border-t border-gray-700 bg-[#020617] text-[12px] px-3 py-2">
           <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px]">
             <span className={`rounded px-2 py-0.5 font-semibold ${showLiveIndicators ? 'bg-emerald-900/40 text-emerald-300' : showCachedIndicators ? 'bg-amber-900/40 text-amber-300' : 'bg-slate-900/60 text-slate-400'}`}>
               {indicatorLabel}
@@ -896,39 +1033,39 @@ const StrikePricesTable = ({ className = "" }: { className?: string }) => {
             ) : null}
           </div>
           <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">ROC</div>
-              <div className={`text-sm font-bold ${(displayedIndicators.roc ?? 0) < 0 ? 'text-red-400' : 'text-green-400'}`}>
+              <div className={`text-base font-bold ${(displayedIndicators.roc ?? 0) < 0 ? 'text-red-400' : 'text-green-400'}`}>
                 {formatIndicatorValue(displayedIndicators.roc)}
               </div>
             </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">RSI</div>
-              <div className="text-sm font-bold text-white">
+              <div className="text-base font-bold text-white">
                 {formatIndicatorValue(displayedIndicators.rsi)}
               </div>
             </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">-DI</div>
-              <div className={`text-sm font-bold ${(displayedIndicators.minusDI ?? 0) > (displayedIndicators.plusDI ?? 0) ? 'text-red-400' : 'text-slate-300'}`}>
+              <div className={`text-base font-bold ${(displayedIndicators.minusDI ?? 0) > (displayedIndicators.plusDI ?? 0) ? 'text-red-400' : 'text-slate-300'}`}>
                 {formatIndicatorValue(displayedIndicators.minusDI)}
               </div>
             </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">+DI</div>
-              <div className={`text-sm font-bold ${(displayedIndicators.plusDI ?? 0) > (displayedIndicators.minusDI ?? 0) ? 'text-green-400' : 'text-slate-300'}`}>
+              <div className={`text-base font-bold ${(displayedIndicators.plusDI ?? 0) > (displayedIndicators.minusDI ?? 0) ? 'text-green-400' : 'text-slate-300'}`}>
                 {formatIndicatorValue(displayedIndicators.plusDI)}
               </div>
             </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">ADX</div>
-              <div className="text-sm font-bold text-cyan-400">
+              <div className="text-base font-bold text-cyan-400">
                 {formatIndicatorValue(displayedIndicators.adx)}
               </div>
             </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5">
+            <div className="rounded border border-slate-800 bg-slate-950/60 px-3 py-2">
               <div className="text-[9px] font-semibold tracking-wide text-slate-500">CHOP</div>
-              <div className={`text-sm font-bold ${(displayedIndicators.chop ?? 0) > 61.8 ? 'text-orange-400' : 'text-slate-300'}`}>
+              <div className={`text-base font-bold ${(displayedIndicators.chop ?? 0) > 61.8 ? 'text-orange-400' : 'text-slate-300'}`}>
                 {formatIndicatorValue(displayedIndicators.chop)}
               </div>
             </div>

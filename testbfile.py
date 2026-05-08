@@ -367,8 +367,11 @@ def load_bot_reference_indicators(
 
     matched_row = find_exact_candle_row(rows, target_open, target_ltp)
     if matched_row is None:
-        print(f"No exact candle found for open={target_open} close={target_ltp}")
-        return EMPTY_INDICATORS.copy(), f"no exact candle found in {path}"
+        matched_row = rows[-1]
+        print(
+            "No exact candle match found; using latest row "
+            f"open={matched_row.get('open')} close={matched_row.get('close')}"
+        )
 
     stored = normalize_indicators(
         {
@@ -452,7 +455,7 @@ def print_indicator_footer(indicators: dict[str, Any]) -> None:
         f"RSI {format_indicator(normalized['rsi'])}",
         f"-DI {format_indicator(normalized['minusDI'])}",
         f"+DI {format_indicator(normalized['plusDI'])}",
-        "ADX -",
+        f"ADX {format_indicator(normalized['adx'])}",
         f"CHOP {format_indicator(normalized['chop'])}",
     ]
 
@@ -529,7 +532,7 @@ def main() -> None:
 
     normalized = normalize_indicators(output_indicators)
 
-    required_keys = ["roc", "rsi", "minusDI", "plusDI", "chop"]
+    required_keys = ["roc", "rsi", "minusDI", "plusDI", "adx", "chop"]
 
     missing = [
         label
